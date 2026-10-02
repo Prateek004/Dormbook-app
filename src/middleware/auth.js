@@ -126,8 +126,9 @@ function assertOwnsResource(table, paramName = 'id') {
   ]);
   if (!ALLOWED.has(table)) throw new Error(`assertOwnsResource: unknown table '${table}'`);
   return (req, res, next) => {
-    // Superadmin bypasses ownership checks
-    if (req.user.role === 'superadmin') return next();
+    // The super-admin has no PG of its own, so it never opens a PG's guest records
+    // (it manages accounts through /admin only, which shows no private guest data).
+    if (req.user.role === 'superadmin' || !req.user.property_id) return res.status(404).json({ error: 'Not found' });
     const db  = getDb();
     const row = db.prepare(`SELECT property_id FROM ${table} WHERE id = ?`).get(req.params[paramName]);
     if (!row) return res.status(404).json({ error: 'Not found' });
