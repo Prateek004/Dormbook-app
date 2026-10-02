@@ -51,6 +51,10 @@ async function ownerLoginCode(req, res) {
   if (!user) return res.status(404).json({ error: 'User not found' });
   if (!STAFF_ROLES.includes(user.role)) return res.status(400).json({ error: 'Login codes are only for staff' });
   if (!user.is_active) return res.status(409).json({ error: 'This user is blocked. Unblock first.' });
+  // A login code lets you sign in as that user: only for users with no more access than you.
+  const { manageProblem, effectivePermissions } = require('../middleware/permissions');
+  const tooMuch = manageProblem(req, [effectivePermissions(user)]);
+  if (tooMuch) return res.status(403).json({ error: tooMuch });
   const out = issueLoginCode(db, user, { createdBy: req.user.id, purpose: 'owner' });
   const sms_sent = await sms.sendLoginCode(user.mobile, out.code);
   writeAudit({ propertyId: req.user.property_id, userId: req.user.id, action: 'LOGIN_CODE_CREATED', entityType: 'users',
