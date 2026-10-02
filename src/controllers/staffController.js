@@ -8,7 +8,7 @@ const { writeAudit }  = require('../middleware/auditLog');
 const { mobile10 } = require('../util/security');
 const sms = require('../services/smsService');
 const { issueLoginCode } = require('./accessController');
-const { PERMISSIONS, ROLE_DEFAULTS, effectivePermissions, sanitizePermissions } = require('../middleware/permissions');
+const { PERMISSIONS, ROLE_DEFAULTS, effectivePermissions, sanitizePermissions, manageProblem } = require('../middleware/permissions');
 
 /** You can only hand out permissions you have yourself (no privilege escalation). */
 function checkGrantable(req, perms) {
@@ -52,6 +52,8 @@ async function inviteStaff(req, res) {
   if (!VALID_ROLES.includes(role)) {
     return res.status(400).json({ error: `role must be one of: ${VALID_ROLES.join(', ')}` });
   }
+  const tooMuch = manageProblem(req, [effectivePermissions({ role, permissions: perms ? JSON.stringify(perms) : null })]);
+  if (tooMuch) return res.status(403).json({ error: tooMuch });
   const hasPassword = password !== undefined && password !== null && password !== '';
   if (hasPassword && (String(password).length < 8 || String(password).length > 200)) {
     return res.status(400).json({ error: 'password must be at least 8 characters' });
@@ -130,6 +132,14 @@ function updateStaff(req, res) {
   if (role && !['manager', 'reception'].includes(newRole)) {
     return res.status(400).json({ error: 'Invalid role' });
   }
+  // Only the owner makes someone a manager.
+  if (newRole === 'manager' && user.role !== 'manager' && !['owner', 'superadmin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Only the owner can make someone a manager.' });
+  }
+  // Not the owner? Only users who have (and will have) no more access than you.
+  const resultPerms = perms ? JSON.stringify(perms) : resetPerms ? null : user.permissions;
+  const tooMuch = manageProblem(req, [effectivePermissions(user), effectivePermissions({ role: newRole, permissions: resultPerms })]);
+  if (tooMuch) return res.status(403).json({ error: tooMuch });
 
   db.prepare(`
     UPDATE users SET name=?, role=?, is_active=?, updated_at=datetime('now') WHERE id=?
@@ -164,6 +174,8 @@ function deactivateStaff(req, res) {
   if (!user) return res.status(404).json({ error: 'Staff member not found' });
   if (user.role === 'owner') return res.status(403).json({ error: 'Cannot deactivate owner account' });
   if (user.id === req.user.id) return res.status(403).json({ error: 'Cannot deactivate your own account' });
+  const tooMuch = manageProblem(req, [effectivePermissions(user)]);
+  if (tooMuch) return res.status(403).json({ error: tooMuch });
 
   // Blocked: signed out everywhere at once (is_active is checked on every request too).
   db.prepare("UPDATE users SET is_active=0, pwd_changed_at=?, updated_at=datetime('now') WHERE id=?").run(new Date().toISOString(), req.params.id);
