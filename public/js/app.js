@@ -1114,8 +1114,12 @@ async function renderCheckin(el) {
       <div class="field">
         <label>Photo of ID <span class="field-note">(front and back — optional but recommended)</span></label>
         <div class="upload-row">
-          <label class="upload-box" id="up-front-box"><input type="file" id="up-front" accept="image/*,application/pdf" capture="environment" hidden /><span>📷 Front</span></label>
-          <label class="upload-box" id="up-back-box"><input type="file" id="up-back" accept="image/*,application/pdf" capture="environment" hidden /><span>📷 Back</span></label>
+          ${['front', 'back'].map(side => `<div class="upload-box" id="up-${side}-box">
+            <span class="up-title">${side === 'front' ? 'Front' : 'Back'}</span>
+            <div class="up-btns">
+              <label class="btn btn-outline btn-sm">📷 Camera<input type="file" class="up-input" data-side="${side}" accept="image/*" capture="environment" hidden /></label>
+              <label class="btn btn-outline btn-sm">🖼 Gallery<input type="file" class="up-input" data-side="${side}" accept="image/*,application/pdf" hidden /></label>
+            </div></div>`).join('')}
         </div>
       </div>
 
@@ -1164,7 +1168,7 @@ async function renderCheckin(el) {
 
       <div class="btn-group mt-12">
         <button type="submit" id="ci-submit" class="btn btn-primary btn-lg" onclick="submitCheckin()">✅ Check in</button>
-        <button type="button" class="btn btn-outline" onclick="navigate('dashboard')">Cancel</button>
+        <button type="button" class="btn btn-outline" onclick="clearCheckinDraft();navigate('dashboard')">Cancel</button>
       </div>
     </form>`;
 
@@ -1202,16 +1206,76 @@ async function renderCheckin(el) {
   ['ci-deposit', 'ci-advance'].forEach(id => $(id).addEventListener('input', ciChange));
   $('ci-mode').addEventListener('change', ciChange);
   $('ci-idtype').addEventListener('change', idHint);
-  ['front', 'back'].forEach(side => $(`up-${side}`).addEventListener('change', async (e) => {
-    const f = e.target.files[0];
+  const markPhoto = (side) => {
+    $(`up-${side}-box`).classList.add('done');
+    $(`up-${side}-box`).querySelector('.up-title').textContent = `✓ ${side === 'front' ? 'Front' : 'Back'} added`;
+  };
+  el.querySelectorAll('.up-input').forEach(input => input.addEventListener('change', async (e) => {
+    const f = e.target.files[0], side = e.target.dataset.side;
+    e.target.value = '';                       // the same photo can be chosen again
     if (!f) return;
     try {
       window._ciFiles[side] = await fileToUpload(f);
-      $(`up-${side}-box`).classList.add('done');
-      $(`up-${side}-box`).querySelector('span').textContent = `✓ ${side === 'front' ? 'Front' : 'Back'} added`;
+      markPhoto(side);
+      saveCheckinDraft();
     } catch (ex) { toast(ex.message, 'error'); }
   }));
   fillRate(); setOut(); summary(); idHint();
+
+  // Half-filled form kept while the user looks at another page; brought back here.
+  const draft = loadCheckinDraft();
+  if (draft) {
+    for (const [id, v] of Object.entries(draft.fields)) {
+      const f = $(id);
+      if (!f) continue;
+      if (f.type === 'checkbox') f.checked = !!v;
+      else if (f.tagName === 'SELECT') { if ([...f.options].some(o => o.value === v)) f.value = v; }
+      else f.value = v;
+    }
+    window._ciFiles = draft.files || {};
+    Object.keys(window._ciFiles).forEach(markPhoto);
+    idHint(); summary(); ciChange();
+    const form = $('checkin-form');
+    form.insertAdjacentHTML('afterbegin', `<div class="draft-banner" id="ci-draft-note">↩ Your unfinished check-in is back.
+      <button type="button" class="btn btn-ghost btn-sm" id="ci-draft-clear">Start fresh</button></div>`);
+    $('ci-draft-clear').addEventListener('click', () => { clearCheckinDraft(); renderCheckin(el); });
+  }
+  $('checkin-form').addEventListener('input', saveCheckinDraft);
+  $('checkin-form').addEventListener('change', saveCheckinDraft);
+}
+
+// ── Unfinished check-in: kept while the user moves around the app ─────────────
+// Stays only on this phone, only for the signed-in user, only until the app is closed
+// (memory + sessionStorage). Cleared on successful check-in, "Start fresh", Cancel and sign-out.
+const CI_DRAFT_KEY = 'dormbook_ci_draft';
+const CI_DRAFT_FIELDS = ['ci-name', 'ci-mobile', 'ci-idtype', 'ci-idnum', 'ci-bed', 'ci-rate-type', 'ci-checkin', 'ci-checkout', 'ci-rent',
+  'ci-deposit', 'ci-advance', 'ci-mode', 'ci-address', 'ci-ec-name', 'ci-ec-mobile', 'ci-from', 'ci-purpose', 'ci-due-day', 'ci-notes', 'ci-consent'];
+function ciDraftOwner() { return (STATE.user && STATE.user.id) || ''; }
+function saveCheckinDraft() {
+  const fields = {};
+  let typed = false;
+  for (const id of CI_DRAFT_FIELDS) {
+    const f = document.getElementById(id);
+    if (!f) continue;
+    fields[id] = f.type === 'checkbox' ? f.checked : f.value;
+    if (['ci-name', 'ci-mobile', 'ci-idnum', 'ci-address', 'ci-notes'].includes(id) && String(f.value || '').trim()) typed = true;
+  }
+  const files = window._ciFiles || {};
+  if (!typed && !Object.keys(files).length) { clearCheckinDraft(); return; }   // nothing worth keeping
+  const draft = { owner: ciDraftOwner(), at: Date.now(), fields, files };
+  window._ciDraft = draft;
+  try { sessionStorage.setItem(CI_DRAFT_KEY, JSON.stringify(draft)); } catch (_) { /* memory copy still works */ }
+}
+function loadCheckinDraft() {
+  let d = window._ciDraft;
+  if (!d) { try { d = JSON.parse(sessionStorage.getItem(CI_DRAFT_KEY) || 'null'); } catch (_) { d = null; } }
+  // Only for the same signed-in user, and not older than 12 hours
+  if (!d || d.owner !== ciDraftOwner() || Date.now() - (d.at || 0) > 12 * 3600 * 1000) { clearCheckinDraft(); return null; }
+  return d;
+}
+function clearCheckinDraft() {
+  window._ciDraft = null;
+  try { sessionStorage.removeItem(CI_DRAFT_KEY); } catch (_) { /* ignore */ }
 }
 
 /** Shrink a phone photo to ≤1600px JPEG (~200–400 KB) before upload; PDFs pass through. */
@@ -1277,6 +1341,7 @@ async function submitCheckin() {
       rent_due_day: parseInt($('ci-due-day').value) || Math.min(28, parseInt(checkIn.slice(8)) || 1),
     };
     const res = await api('POST', '/residents', data);
+    clearCheckinDraft();
     const failed = await uploadResidentDocs(res.resident.id, window._ciFiles || {});
     toast(failed ? `${data.full_name} checked in. ${failed} ID photo(s) did not upload — add them from the resident's page.`
                  : `${data.full_name} checked in to ${$('ci-bed').selectedOptions[0].text.split(' ')[0]}`, failed ? 'warning' : 'success', 6000);
@@ -1352,7 +1417,8 @@ async function showResidentDetail(id) {
       ${docs.map(d => can('view_id_docs')
         ? `<button class="btn btn-outline btn-sm" onclick="viewDocument('${r.id}','${d.id}')">📄 ${label[d.doc_type] || 'Document'}</button>`
         : `<span class="badge badge-gray">📄 ${label[d.doc_type] || 'Document'}</span>`).join('') || '<span class="text-muted">No ID photo uploaded</span>'}
-      ${can('checkin') || can('view_id_docs') ? `<label class="btn btn-outline btn-sm">+ Add photo<input type="file" accept="image/*,application/pdf" capture="environment" hidden onchange="addResidentDoc('${r.id}', this)" /></label>` : ''}
+      ${can('checkin') || can('view_id_docs') ? `<label class="btn btn-outline btn-sm">📷 Camera<input type="file" accept="image/*" capture="environment" hidden onchange="addResidentDoc('${r.id}', this)" /></label>
+        <label class="btn btn-outline btn-sm">🖼 Gallery<input type="file" accept="image/*,application/pdf" hidden onchange="addResidentDoc('${r.id}', this)" /></label>` : ''}
     </div>
     <div class="btn-group mt-12">
       ${r.status === 'active' && can('payments') ? `<button class="btn btn-primary btn-sm" onclick="closeModal();showPaymentModal('${r.id}','${esc(r.full_name)}')">Record payment</button>` : ''}
