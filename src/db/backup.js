@@ -9,6 +9,8 @@
  *
  * Uses SQLite "VACUUM INTO": a complete, consistent copy (WAL included) taken
  * while the app keeps running. A failed backup is logged and never stops the app.
+ *  - If Cloudflare R2 is set up, each copy is also uploaded (encrypted) to R2 —
+ *    see services/offsite.js. Restore from R2: node src/scripts/r2-restore.js
  * To restore: stop the service, copy a backup over DB_DIR/dormbook.db, start again.
  */
 const fs = require('fs');
@@ -43,6 +45,12 @@ function backupDb(db, dbPath, kind = 'manual') {
     }
     const kb = Math.round(fs.statSync(file).size / 1024);
     console.log(`[BACKUP] Saved ${path.basename(file)} (${kb} KB)`);
+    // Off-site copy in Cloudflare R2 (if set up). Runs a few seconds later in the
+    // background so it never slows boot or the nightly job, and never throws.
+    setTimeout(() => {
+      try { require('../services/offsite').uploadBackup(file, kind).catch(() => {}); }
+      catch (e) { console.error('[BACKUP] Off-site copy skipped:', e.message); }
+    }, Number(process.env.R2_BACKUP_DELAY_MS) || 10000).unref();
     return file;
   } catch (e) {
     console.error('[BACKUP] Failed (app keeps running):', e.message);
