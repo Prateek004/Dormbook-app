@@ -9,10 +9,9 @@
  *   Signed-in users (loose)      per user                 RL_USER_MAX / RL_USER_WINDOW_SEC              (600 / 60 s)
  *   Flood guard, whole API       per IP                   RL_IP_FLOOD_MAX / RL_USER_WINDOW_SEC          (3000 / 60 s)
  *
- * Per-account wrong password / MPIN: exponential back-off, not a hard lock-out.
- *   First AUTH_FREE_TRIES (5) wrong tries cost nothing; then the wait is
- *   AUTH_BACKOFF_BASE_SEC (30 s) × 2^(extra tries), never more than AUTH_BACKOFF_MAX_MIN (15 min).
- *   A correct sign-in resets it. (Staff MPIN is still switched off after MPIN_WIPE_AT (10) misses.)
+ * Per-account wrong password / MPIN: after AUTH_LOCK_AFTER (6) wrong tries in a row the account
+ *   is locked for AUTH_LOCK_MIN (15) minutes. Every further AUTH_LOCK_AFTER wrong tries lock it
+ *   again. A correct sign-in resets the count. (Staff MPIN is switched off after MPIN_WIPE_AT (10) misses.)
  *
  * The flood guard is high on purpose: a whole hostel's staff can share one Wi-Fi IP.
  * Limits are kept in memory (one server). Set RL_DISABLED=true only for load tests.
@@ -37,18 +36,23 @@ const CFG = Object.freeze({
   userMax:          num('RL_USER_MAX', 600),
   userWindowMs:     num('RL_USER_WINDOW_SEC', 60) * 1000,
   ipFloodMax:       num('RL_IP_FLOOD_MAX', 3000),
-  freeTries:        num('AUTH_FREE_TRIES', 5, 1, 100),
-  backoffBaseSec:   num('AUTH_BACKOFF_BASE_SEC', 30, 1, 3600),
-  backoffMaxMin:    num('AUTH_BACKOFF_MAX_MIN', 15, 1, 24 * 60),
+  lockAfter:        num('AUTH_LOCK_AFTER', 6, 3, 20),
+  lockMin:          num('AUTH_LOCK_MIN', 15, 1, 24 * 60),
   mpinWipeAt:       num('MPIN_WIPE_AT', 10, 3, 1000),
   disabled:         process.env.RL_DISABLED === 'true',
 });
 
-/** Seconds to wait after `n` wrong tries in a row (0 = no wait). Exponential, capped. */
+/** Seconds the account is locked after `n` wrong tries in a row (0 = not locked).
+ *  Locks on the 6th wrong try (and the 12th, 18th…) for AUTH_LOCK_MIN minutes. */
 function backoffSeconds(n) {
-  if (!Number.isFinite(n) || n < CFG.freeTries) return 0;
-  const extra = Math.min(n - CFG.freeTries, 20);           // 2^20 is already far past the cap
-  return Math.min(CFG.backoffMaxMin * 60, CFG.backoffBaseSec * 2 ** extra);
+  if (!Number.isFinite(n) || n < CFG.lockAfter || n % CFG.lockAfter !== 0) return 0;
+  return CFG.lockMin * 60;
+}
+
+/** Wrong tries left before the next lock (for the warning shown on the sign-in screen). */
+function triesLeft(n) {
+  if (!Number.isFinite(n) || n < 0) return CFG.lockAfter;
+  return CFG.lockAfter - (n % CFG.lockAfter);
 }
 
 /** "45 seconds" / "3 minutes" */
@@ -128,4 +132,4 @@ function applyRateLimits(app) {
   app.use('/api/', publicIp, perUser);
 }
 
-module.exports = { CFG, backoffSeconds, waitText, applyRateLimits, billLink };
+module.exports = { CFG, backoffSeconds, triesLeft, waitText, applyRateLimits, billLink };
