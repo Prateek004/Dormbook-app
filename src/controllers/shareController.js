@@ -66,7 +66,7 @@ const fmtD = (d) => { if (!d) return ''; const [y, m, dd] = String(d).slice(0, 1
 
 function page(title, body) {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><title>${esc(title)}</title>
+<meta name="robots" content="noindex,nofollow"><link rel="icon" href="/icons/logo.svg" type="image/svg+xml"><title>${esc(title)}</title>
 <style>
 :root{--ink:#1f2a2e;--muted:#6b7280;--line:#e5e7eb;--bad:#b91c1c;--good:#047857;--brand:#0f766e}
 *{box-sizing:border-box}body{margin:0;background:#f6f7f5;color:var(--ink);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -136,7 +136,7 @@ function renderBill(b) {
     ${b.payments.length ? `<h4 style="margin:16px 0 4px">Payments</h4><table><tbody>${b.payments.map((p) =>
       `<tr><td>${fmtD(p.date)}</td><td>${esc(p.what)}</td><td>${esc(p.mode)}</td><td class="num">${inr(p.amount)}</td></tr>`).join('')}</tbody></table>` : ''}
     ${payBox}
-    <div class="foot">This is a computer-generated ${esc(b.title.toLowerCase())} · DormBook — a product of A&amp;P Infotech Solution</div>
+    <div class="foot"><img src="/icons/logo.svg" width="18" height="18" alt="" style="vertical-align:middle;margin-right:6px">This is a computer-generated ${esc(b.title.toLowerCase())} · DormBook — a product of A&amp;P Infotech Solution</div>
     </article>`);
 }
 
