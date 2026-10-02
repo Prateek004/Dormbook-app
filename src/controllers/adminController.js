@@ -239,6 +239,7 @@ function deleteAccount(req, res) {
       try { fs.rmSync(dir, { recursive: true, force: true }); }
       catch (e) { console.error('[SUPERADMIN] could not remove uploads for property', pid, e.message); }
     }
+    require('../services/offsite').deletePropertyDocsLater(pid);   // R2 copies too (if R2 is set up)
   }
 
   console.log(`[SUPERADMIN] Account deleted: ${account.id} (${removedRows} rows) by ${req.user.id}`);
