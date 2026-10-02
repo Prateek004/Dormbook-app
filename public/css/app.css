@@ -683,3 +683,12 @@ html, body { font-size: 15px; }
 #register-screen.hidden, #mpin-screen.hidden, #forgot-screen.hidden { display: none !important; }
 .auth-card { max-width: calc(100vw - 24px); box-sizing: border-box; }
 @media (max-width: 420px) { .auth-card { padding: 28px 20px; } }
+
+/* ID photo: Camera / Gallery choice in each box */
+.upload-box { cursor: default; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.upload-box .up-title { font-weight: 600; }
+.upload-box .up-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.upload-box .up-btns .btn { cursor: pointer; }
+/* "Your unfinished check-in is back" */
+.draft-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  background: #fff8e6; color: #7a4b00; border: 1px solid #f3dca6; padding: 8px 12px; border-radius: var(--radius); margin-bottom: 12px; font-weight: 600; font-size: 14px; }
