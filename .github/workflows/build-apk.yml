@@ -70,8 +70,12 @@ jobs:
         run: |
           npm install --no-audit --no-fund --no-save sharp@0.33 @capacitor/assets@3
           node tools/make-app-icons.js
-          npx capacitor-assets generate --android
-          ls android/app/src/main/res/mipmap-xxxhdpi/
+          if [ -f assets/icon-only.png ]; then
+            npx capacitor-assets generate --android
+            ls android/app/src/main/res/mipmap-xxxhdpi/
+          else
+            echo "No logo found - keeping the default app icon."
+          fi
 
       - name: Allow camera access (used for scanning UPI/QR images)
         run: |
