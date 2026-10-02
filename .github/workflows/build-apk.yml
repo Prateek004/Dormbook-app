@@ -1,0 +1,136 @@
+name: Build Android APK
+
+# Builds the DormBook Android app on every push to main and publishes it at a
+# permanent download link:
+#   https://github.com/Prateek004/Dormbook-tested/releases/download/android-latest/DormBook.apk
+#
+# The app is a thin shell that opens the live server
+# (capacitor.config.json -> server.url), so the phone and the website always
+# show the same data. Web changes reach the phone on the next app open; a new
+# APK is only needed for app-shell changes (icon, name, permissions).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write   # needed to publish the APK on the Releases page
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install server dependencies
+        run: npm install --no-audit --no-fund
+
+      # Never ship an app build from code whose tests fail.
+      - name: Run server tests
+        run: npm test
+
+      # Saved into package.json on this throwaway CI checkout only (never
+      # committed) so Capacitor detects the @capacitor/app plugin, which
+      # handles the Android back button.
+      - name: Install Capacitor tooling (CI only)
+        run: npm install --no-audit --no-fund @capacitor/core@6 @capacitor/android@6 @capacitor/cli@6 @capacitor/app@6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Accept Android SDK licenses
+        run: yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Add Android platform (Capacitor)
+        run: npx cap add android
+
+      - name: Sync web assets into Android project
+        run: npx cap sync android
+
+      # App icon + splash screen = the DormBook logo (public/icons/logo.svg).
+      # The tools are installed on this throwaway CI checkout only (--no-save).
+      - name: DormBook logo as app icon and splash screen
+        run: |
+          npm install --no-audit --no-fund --no-save sharp@0.33 @capacitor/assets@3
+          node tools/make-app-icons.js
+          npx capacitor-assets generate --android
+          ls android/app/src/main/res/mipmap-xxxhdpi/
+
+      - name: Allow camera access (used for scanning UPI/QR images)
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          if ! grep -q "android.permission.CAMERA" "$MANIFEST"; then
+            sed -i 's#<uses-permission android:name="android.permission.INTERNET" />#<uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.CAMERA" />#' "$MANIFEST"
+          fi
+          grep -q "android.permission.CAMERA" "$MANIFEST"
+
+      # Every build gets a higher version number so phones accept it as an update.
+      - name: Set app version from build number
+        run: |
+          sed -i -E "s/versionCode [0-9]+/versionCode ${{ github.run_number }}/; s/versionName \"[^\"]*\"/versionName \"2.0.${{ github.run_number }}\"/" android/app/build.gradle
+          grep -E "versionCode|versionName" android/app/build.gradle
+
+      # With the DEBUG_KEYSTORE_BASE64 secret set, every APK is signed with the
+      # same key, so new versions install over old ones. Without it, GitHub
+      # makes a fresh key per build and phones must uninstall before updating.
+      - name: Use stable signing key (if configured)
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_BASE64" ]; then
+            mkdir -p "$HOME/.android"
+            echo "$DEBUG_KEYSTORE_BASE64" | base64 -d > "$HOME/.android/debug.keystore"
+            echo "Stable signing key installed."
+          else
+            echo "::warning::DEBUG_KEYSTORE_BASE64 secret not set - APK signed with a one-off key; updates will need an uninstall first."
+          fi
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Name the APK
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk DormBook.apk
+          ls -lh DormBook.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dormbook-apk
+          path: DormBook.apk
+
+      - name: Publish APK to permanent download link
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=android-latest
+          NOTES="DormBook Android app - build #${{ github.run_number }} (version 2.0.${{ github.run_number }}) from commit ${GITHUB_SHA::7}, built $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          Download: https://github.com/${{ github.repository }}/releases/download/${TAG}/DormBook.apk"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "DormBook Android app" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" DormBook.apk --clobber
+          gh release edit "$TAG" --notes "$NOTES"
+          echo "APK published: https://github.com/${{ github.repository }}/releases/download/${TAG}/DormBook.apk"
