@@ -89,4 +89,23 @@ function hasPermission(req, perm) {
   return req.user.permissions.includes(perm);
 }
 
-module.exports = { PERMISSIONS, ALL, ROLE_DEFAULTS, can, hasPermission, effectivePermissions, sanitizePermissions };
+/**
+ * A staff member who manages users may only act on users who end up with NO MORE access than
+ * themselves. Stops "reset the manager's password / give them a login code, then sign in as them".
+ * Owner and superadmin may manage everyone. Returns an error message, or null when allowed.
+ */
+function manageProblem(req, targetPermissionLists) {
+  if (!req.user) return 'Unauthenticated';
+  if (req.user.role === 'owner' || req.user.role === 'superadmin') return null;
+  if (req.user.permissions === undefined) {
+    req.user.permissions = effectivePermissions({ ...req.user, permissions: loadUserPermissions(req.user.id) });
+  }
+  const mine = req.user.permissions;
+  for (const list of targetPermissionLists) {
+    const extra = (list || []).filter((p) => !mine.includes(p));
+    if (extra.length) return `Only the owner can manage a user who has access you don't have (${extra.map((p) => PERMISSIONS[p] || p).join(', ')}).`;
+  }
+  return null;
+}
+
+module.exports = { PERMISSIONS, ALL, ROLE_DEFAULTS, can, hasPermission, effectivePermissions, sanitizePermissions, manageProblem };
