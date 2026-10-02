@@ -7,7 +7,7 @@
  * IMPORTANT: Bump CACHE_VERSION on every deploy that changes static files.
  */
 
-const CACHE_VERSION   = 'dormbook-v4.8';
+const CACHE_VERSION   = 'dormbook-v4.9';
 const STATIC_CACHE    = `${CACHE_VERSION}-static`;
 
 const STATIC_ASSETS = [
@@ -16,6 +16,8 @@ const STATIC_ASSETS = [
   '/css/app.css',
   '/js/app.js',
   '/manifest.json',
+  '/icons/logo.svg',
+  '/icons/icon-192.png',
 ];
 
 // ── Install: cache static assets ───────────────────────────────────────────
