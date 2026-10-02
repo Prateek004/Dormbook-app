@@ -24,6 +24,9 @@ app.set('trust proxy', 1);
 // Query strings are parsed simply (no nested objects/arrays): nothing in the app needs more,
 // and it closes the known "qs" denial-of-service holes.
 app.set('query parser', 'simple');
+// Behind Cloudflare: use the visitor's real IP (only when the request truly came
+// through Cloudflare). Must run before logging and rate limits.
+app.use(require('./middleware/cloudflare').cloudflareRealIp);
 
 // A crash-proof server must survive stray async errors instead of exiting.
 // Log loudly and keep serving; a single bad request should never take the
@@ -162,6 +165,8 @@ function checkRequiredEnv() {
     startScheduler();
     app.listen(PORT, () => {
       console.log(`[SERVER] DormBook v4.0 on port ${PORT} (${ENV})`);
+      // Cloudflare R2: one quick connection test so Railway logs say clearly if it works.
+      require('./services/r2').check().catch(() => {});
     });
   } catch (err) {
     console.error('[BOOT ERROR]', err.message, err.stack);
