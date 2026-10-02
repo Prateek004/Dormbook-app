@@ -51,6 +51,15 @@ function startScheduler() {
   }), { name: 'db-backup', timezone: APP_TZ });
   setTimeout(safe('rent-billing-boot', runDailyBilling), 5000);
 
+  // Off-site copies in Cloudflare R2 (only if R2 is set up): make sure every ID
+  // document on the volume also exists in R2. Nightly, and once ~1 min after boot.
+  const r2Sync = () => {
+    if (!require('./r2').enabled()) return;
+    require('./offsite').syncDocs(getDb()).catch((e) => console.error('[SCHEDULER] R2 sync failed:', e.message));
+  };
+  cron.schedule('45 3 * * *', safe('r2-doc-sync', r2Sync), { name: 'r2-doc-sync', timezone: APP_TZ });
+  setTimeout(safe('r2-doc-sync-boot', r2Sync), 60000).unref();
+
   // ── 1. Rent reminders — daily at 09:00 ──────────────────
   cron.schedule('0 9 * * *', safe('rent-reminders', sendTieredRentReminders), { name: 'rent-reminders', timezone: APP_TZ });
 
