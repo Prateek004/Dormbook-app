@@ -15,7 +15,16 @@ const path = require('path');
 const sharp = require('sharp');
 
 const root = path.join(__dirname, '..');
-const svg = fs.readFileSync(path.join(root, 'public', 'icons', 'logo.svg'));
+// Source: the vector logo; if it is missing, the 512px app icon; if both are missing,
+// make nothing and let the build continue with the default icon (never fail the APK).
+const sources = [path.join(root, 'public', 'icons', 'logo.svg'), path.join(root, 'public', 'icons', 'icon-512.png')];
+const src = sources.find((f) => fs.existsSync(f));
+if (!src) {
+  console.log('::warning::public/icons/logo.svg not found - APK keeps the default icon. Add the logo file and build again.');
+  process.exit(0);
+}
+if (!src.endsWith('logo.svg')) console.log('::warning::public/icons/logo.svg not found - using icon-512.png instead.');
+const svg = fs.readFileSync(src);
 const out = path.join(root, 'assets');
 fs.mkdirSync(out, { recursive: true });
 
@@ -23,7 +32,7 @@ const WHITE = { r: 255, g: 255, b: 255, alpha: 1 };
 const CLEAR = { r: 0, g: 0, b: 0, alpha: 0 };
 
 async function logo(size) {
-  return sharp(svg, { density: 600 }).resize(size, size, { fit: 'contain', background: CLEAR }).png().toBuffer();
+  return sharp(svg, src.endsWith('.svg') ? { density: 600 } : {}).resize(size, size, { fit: 'contain', background: CLEAR }).png().toBuffer();
 }
 
 async function canvas(file, size, bg, logoSize) {
