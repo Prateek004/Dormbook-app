@@ -656,3 +656,30 @@ html, body { font-size: 15px; }
 /* The header must never be squeezed by a long page (it sits in a flex column) */
 .page-header { flex-shrink: 0; }
 .page-content { flex-shrink: 0; }
+
+/* ══ DormBook logo (public/icons/logo.svg) — every screen ══════════════════ */
+.brand-mark { display: block; flex-shrink: 0; object-fit: contain; -webkit-user-drag: none; user-select: none; }
+.loading-logo { flex-direction: column; gap: 12px; color: #075E71; }
+.loading-logo .brand-mark { animation: brand-pulse 1.6s ease-in-out infinite; }
+@keyframes brand-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+@media (prefers-reduced-motion: reduce) { .loading-logo .brand-mark { animation: none; } }
+.auth-logo .brand-mark { margin: 0 auto 12px; width: 64px; height: 64px; }
+.brand-word { font-size: 13px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; color: #075E71; margin-bottom: 2px; }
+.sidebar-logo { color: #075E71; }
+.sidebar-logo .brand-mark { width: 32px; height: 32px; }
+/* Logo in the top bar only where the side menu is hidden (phones, installed app) */
+.header-logo { display: none; width: 28px; height: 28px; }
+@media (max-width: 768px) { .header-logo { display: block; } }
+.app-ui .header-logo { display: block; width: 30px; height: 30px; order: 1; }
+.app-ui #page-title { order: 1; }
+/* Small logo in the footer of every bill / report (on screen and on paper) */
+.rep-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rep-foot .foot-mark { width: 16px; height: 16px; display: inline-block; vertical-align: middle; }
+@media print { .rep-foot .foot-mark { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }
+/* Sign-up / MPIN / reset screens centred like Sign In (they sat at the top-left before),
+   and the card never wider than a small phone. */
+#register-screen, #mpin-screen, #forgot-screen { display: flex; align-items: flex-start; justify-content: center;
+  background: var(--gray-50); overflow-y: auto; padding: 24px 12px; height: auto; min-height: 100vh; box-sizing: border-box; }
+#register-screen.hidden, #mpin-screen.hidden, #forgot-screen.hidden { display: none !important; }
+.auth-card { max-width: calc(100vw - 24px); box-sizing: border-box; }
+@media (max-width: 420px) { .auth-card { padding: 28px 20px; } }
