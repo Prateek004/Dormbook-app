@@ -4,7 +4,7 @@
   "webDir": "public",
   "server": {
     "androidScheme": "https",
-    "url": "https://dormbook-tested-production.up.railway.app",
+    "url": "https://dormbook-app-production.up.railway.app",
     "cleartext": false,
     "errorPath": "offline.html"
   }
