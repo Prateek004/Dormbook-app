@@ -1,0 +1,11 @@
+{
+  "appId": "com.apinfotech.dormbook",
+  "appName": "DormBook",
+  "webDir": "public",
+  "server": {
+    "androidScheme": "https",
+    "url": "https://dormbook-tested-production.up.railway.app",
+    "cleartext": false,
+    "errorPath": "offline.html"
+  }
+}
