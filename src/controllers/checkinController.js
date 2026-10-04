@@ -8,9 +8,10 @@ const { scheduleWhatsApp } = require('../services/whatsappService');
 
 const { int, text } = require('../util/input');
 const ledger = require('../services/ledger');
-const { istDate, isValidDate } = require('../util/time');
+const { istDate, isValidDate, addDays, daysBetween } = require('../util/time');
 const { validateId, idDisplay } = require('../util/idproof');
 const { hasPermission } = require('../middleware/permissions');
+const PT = require('../services/propertyType');
 
 // MONEY CONTRACT: the frontend already converts rupees → integer paise
 // (Math.round(rupees * 100)) before sending. The backend must PRESERVE that
@@ -70,7 +71,9 @@ function checkIn(req, res) {
   const mobile                   = text(req.body.mobile, 20);
   const bed_id                   = text(req.body.bed_id, 64);
   const check_in_date            = text(req.body.check_in_date, 10);
-  const expected_checkout        = text(req.body.expected_checkout, 10);
+  // Open-ended stay (PG / monthly hostel): no leaving date until the tenant gives notice.
+  const openEnded = req.body.open_ended === true;
+  const expected_checkout        = openEnded ? null : text(req.body.expected_checkout, 10);
   const aadhaar_number           = text(req.body.aadhaar_number, 20);
   const aadhaar_mobile           = text(req.body.aadhaar_mobile, 20);
   const aadhaar_photo_path       = text(req.body.aadhaar_photo_path, 300);
@@ -83,7 +86,7 @@ function checkIn(req, res) {
   const notes                    = text(req.body.notes, 500);
 
   // Required fields
-  const required = { full_name, mobile, bed_id, check_in_date, expected_checkout };
+  const required = { full_name, mobile, bed_id, check_in_date, ...(openEnded ? {} : { expected_checkout }) };
   for (const [f, v] of Object.entries(required)) {
     if (!v) return res.status(400).json({ error: `'${f}' is required` });
   }
@@ -101,11 +104,20 @@ function checkIn(req, res) {
   const mobileClean = mobile.replace(/\D/g, '');
   if (mobileClean.length < 10 || mobileClean.length > 12) return res.status(400).json({ error: 'Invalid mobile' });
   if (!isValidDate(check_in_date)) return res.status(400).json({ error: 'check_in_date: YYYY-MM-DD' });
-  if (!isValidDate(expected_checkout)) return res.status(400).json({ error: 'expected_checkout: YYYY-MM-DD' });
-  if (expected_checkout <= check_in_date) return res.status(400).json({ error: 'checkout must be after check-in' });
+  if (!openEnded && !isValidDate(expected_checkout)) return res.status(400).json({ error: 'expected_checkout: YYYY-MM-DD' });
+  if (!openEnded && expected_checkout <= check_in_date) return res.status(400).json({ error: 'checkout must be after check-in' });
 
   const RATE_TYPES = ['daily', 'weekly', 'monthly'];
   if (!RATE_TYPES.includes(rate_type)) return res.status(400).json({ error: `rate_type must be: ${RATE_TYPES.join(', ')}` });
+  if (openEnded && rate_type === 'daily') return res.status(400).json({ error: 'A stay with no leaving date must be charged per week or per month' });
+
+  // What this property offers (food, notice, lock-in) is copied onto the stay.
+  const prop = PT.propertyRow(db, propertyId);
+  const propFood = PT.FOOD_PLANS.includes(prop.food_plan) ? prop.food_plan : 'none';
+  const foodIn = req.body.food_plan === undefined || req.body.food_plan === null ? propFood : String(req.body.food_plan);
+  if (!PT.FOOD_PLANS.includes(foodIn)) return res.status(400).json({ error: 'Food plan is not valid' });
+  const genderIn = req.body.gender ? String(req.body.gender) : null;
+  if (genderIn && !['male', 'female', 'other'].includes(genderIn)) return res.status(400).json({ error: 'Gender must be male, female or other' });
 
   const MODES = ['cash', 'upi', 'card', 'bank_transfer'];
   const mode  = MODES.includes(payment_mode) ? payment_mode : 'cash';
@@ -134,6 +146,7 @@ function checkIn(req, res) {
     if (val < 0)      return res.status(400).json({ error: `${field} must be ≥ 0` });
   }
 
+  if (!ratePaise && rate_type === 'monthly' && bed.monthly_rate_paise > 0) ratePaise = bed.monthly_rate_paise;
   if (!ratePaise && bed.daily_rate_paise) {
     if (rate_type === 'daily') ratePaise = bed.daily_rate_paise;
     else if (rate_type === 'weekly') ratePaise = bed.daily_rate_paise * 7;
@@ -207,6 +220,8 @@ function checkIn(req, res) {
 
     db.prepare('UPDATE residents SET id_type = ?, id_number_encrypted = ?, id_last4 = ? WHERE id = ?')
       .run(idCheck.type, idEncrypted, idLast4, residentId);
+    db.prepare('UPDATE residents SET food_plan = ?, notice_days = ?, lock_in_months = ?, gender = ? WHERE id = ?')
+      .run(foodIn, Number(prop.notice_days) || 0, Number(prop.lock_in_months) || 0, genderIn, residentId);
 
     // GST on rent: copy the property's setting onto this stay (before the first bill).
     const gst = db.prepare('SELECT gst_enabled, rent_gst_rate_bp, rent_gst_inclusive FROM properties WHERE id = ?').get(propertyId);
@@ -251,7 +266,7 @@ function checkIn(req, res) {
   writeAudit({ propertyId, userId: req.user.id, action: 'CHECKIN',
     entityType: 'resident', entityId: residentId,
     amountPaise: depositPaise + paidPaise,
-    snapshot: { resident: full_name, bed_id, check_in_date, rate_type, rate_paise: ratePaise, deposit: depositPaise },
+    snapshot: { resident: full_name, bed_id, check_in_date, rate_type, rate_paise: ratePaise, deposit: depositPaise, open_ended: openEnded, food_plan: foodIn },
     ip: req.ip });
 
   scheduleWhatsApp({ propertyId, residentId, recipientMobile: mobileClean, recipientType: 'tenant',
@@ -274,7 +289,7 @@ function listResidents(req, res) {
   const search = rawSearch ? String(rawSearch).trim().substring(0, 100) : null;
   let query = `
     SELECT r.id, r.full_name, r.mobile, r.aadhaar_last4,
-      r.check_in_date, r.expected_checkout, r.actual_checkout,
+      r.check_in_date, r.expected_checkout, r.actual_checkout, r.notice_given_on, r.food_plan,
       r.monthly_rent_paise, r.rate_type, r.rate_paise,
       r.deposit_paise, r.status, r.rent_due_day, r.created_at, r.checkin_by,
       b.bed_label, b.status as bed_status, b.daily_rate_paise,
@@ -496,7 +511,79 @@ function checkoutPreview(req, res) {
   }
   const prop = db.prepare('SELECT refund_approval_threshold_paise FROM properties WHERE id = ?').get(propertyId);
   out.needs_approval = out.refund_paise > (prop?.refund_approval_threshold_paise ?? 0) && !hasPermission(req, 'approvals');
+  out.terms = stayTerms(resident, date);
   return res.json(out);
+}
+
+/**
+ * Notice period and lock-in for one stay on a given leaving date. Only a warning for staff:
+ * nothing is charged unless staff add it at checkout (the suggested amount is rent for the
+ * days of notice not served).
+ */
+function stayTerms(r, date) {
+  const noticeDays = Number(r.notice_days) || 0, lockIn = Number(r.lock_in_months) || 0;
+  const out = { notice_days: noticeDays, notice_given_on: r.notice_given_on || null, lock_in_months: lockIn,
+    food_plan: r.food_plan || 'none', notice_short_days: 0, notice_short_charge_paise: 0, lock_in_end: null, before_lock_in: false };
+  if (noticeDays > 0) {
+    const served = r.notice_given_on ? Math.max(0, daysBetween(r.notice_given_on, date)) : 0;
+    out.notice_short_days = Math.max(0, noticeDays - served);
+    const rate = Number(r.rate_paise) || 0;
+    const perDay = r.rate_type === 'daily' ? rate : r.rate_type === 'weekly' ? Math.round(rate / 7) : Math.round(rate / 30);
+    out.notice_short_charge_paise = perDay * out.notice_short_days;
+  }
+  if (lockIn > 0 && isValidDate(r.check_in_date)) {
+    out.lock_in_end = ledger.addMonthsAnchored(r.check_in_date, lockIn);
+    out.before_lock_in = date < out.lock_in_end;
+  }
+  return out;
+}
+
+/**
+ * POST /api/v1/residents/:id/notice  { notice_date?, leaving_date? }
+ * The tenant says they are leaving. The leaving date becomes notice date + notice period
+ * (or the date given). Rent keeps running as normal until the actual checkout.
+ */
+function giveNotice(req, res) {
+  const db = getDb();
+  const r = db.prepare("SELECT * FROM residents WHERE id = ? AND property_id = ?").get(req.params.id, req.user.property_id);
+  if (!r) return res.status(404).json({ error: 'Resident not found' });
+  if (r.status !== 'active') return res.status(409).json({ error: 'This guest has already left' });
+  if (r.notice_given_on) return res.status(409).json({ error: `Notice was already given on ${r.notice_given_on}. Take it back first to change it.` });
+  const today = istDate();
+  const noticeDate = req.body && req.body.notice_date ? text(req.body.notice_date, 10) : today;
+  if (!isValidDate(noticeDate)) return res.status(400).json({ error: 'notice_date: YYYY-MM-DD' });
+  if (noticeDate > today) return res.status(400).json({ error: 'Notice date cannot be in the future' });
+  if (r.check_in_date && noticeDate < r.check_in_date) return res.status(400).json({ error: 'Notice date is before the check-in date' });
+  const days = Number(r.notice_days) || 0;
+  let leaving = req.body && req.body.leaving_date ? text(req.body.leaving_date, 10) : null;
+  if (leaving && !isValidDate(leaving)) return res.status(400).json({ error: 'leaving_date: YYYY-MM-DD' });
+  if (!leaving) {
+    if (!days) return res.status(400).json({ error: 'Choose the leaving date' });
+    leaving = addDays(noticeDate, days);
+  }
+  if (leaving < noticeDate) return res.status(400).json({ error: 'Leaving date cannot be before the notice date' });
+  if (r.check_in_date && leaving <= r.check_in_date) return res.status(400).json({ error: 'Leaving date must be after the check-in date' });
+
+  db.prepare(`UPDATE residents SET notice_given_on = ?, checkout_before_notice = expected_checkout, expected_checkout = ?,
+    updated_at = datetime('now') WHERE id = ?`).run(noticeDate, leaving, r.id);
+  const shortDays = Math.max(0, days - daysBetween(noticeDate, leaving));
+  writeAudit({ propertyId: r.property_id, userId: req.user.id, action: 'NOTICE_GIVEN', entityType: 'resident', entityId: r.id,
+    snapshot: { notice_date: noticeDate, leaving_date: leaving, notice_days: days, short_days: shortDays, before: r.expected_checkout }, ip: req.ip });
+  return res.json({ notice_given_on: noticeDate, expected_checkout: leaving, notice_days: days, short_days: shortDays });
+}
+
+/** DELETE /api/v1/residents/:id/notice — the tenant is staying after all; the old leaving date comes back. */
+function cancelNotice(req, res) {
+  const db = getDb();
+  const r = db.prepare("SELECT * FROM residents WHERE id = ? AND property_id = ?").get(req.params.id, req.user.property_id);
+  if (!r) return res.status(404).json({ error: 'Resident not found' });
+  if (r.status !== 'active') return res.status(409).json({ error: 'This guest has already left' });
+  if (!r.notice_given_on) return res.status(409).json({ error: 'No notice was given' });
+  db.prepare(`UPDATE residents SET expected_checkout = checkout_before_notice, notice_given_on = NULL, checkout_before_notice = NULL,
+    updated_at = datetime('now') WHERE id = ?`).run(r.id);
+  writeAudit({ propertyId: r.property_id, userId: req.user.id, action: 'NOTICE_CANCELLED', entityType: 'resident', entityId: r.id,
+    snapshot: { notice_date: r.notice_given_on, leaving_date: r.expected_checkout, restored: r.checkout_before_notice }, ip: req.ip });
+  return res.json({ expected_checkout: r.checkout_before_notice || null });
 }
 
 /**
@@ -559,7 +646,7 @@ function extendStay(req, res) {
 
   const resident = db.prepare("SELECT * FROM residents WHERE id = ? AND property_id = ? AND status = 'active'").get(id, propertyId);
   if (!resident) return res.status(404).json({ error: 'Active resident not found' });
-  if (new_expected_checkout <= resident.expected_checkout) return res.status(400).json({ error: 'New date must be after current' });
+  if (new_expected_checkout <= (resident.expected_checkout || resident.check_in_date)) return res.status(400).json({ error: 'New date must be after current' });
 
   const now = new Date().toISOString();
   let newRate = resident.rate_paise;
@@ -572,7 +659,7 @@ function extendStay(req, res) {
 
   db.transaction(() => {
     db.prepare(`INSERT INTO stay_extensions (id,resident_id,property_id,old_checkout,new_checkout,old_rent_paise,new_rent_paise,notes,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(uuidv4(), id, propertyId, resident.expected_checkout, new_expected_checkout, resident.rate_paise, newRate, notes||null, req.user.id, now);
+      .run(uuidv4(), id, propertyId, resident.expected_checkout || 'open-ended', new_expected_checkout, resident.rate_paise, newRate, notes||null, req.user.id, now);
     db.prepare(`UPDATE residents SET expected_checkout=?, rate_paise=?, rate_type=?, monthly_rent_paise=?, updated_at=datetime('now') WHERE id=?`)
       .run(new_expected_checkout, newRate, newType, newType==='daily'?newRate*30:newType==='weekly'?newRate*4:newRate, id);
   })();
@@ -611,4 +698,4 @@ function updateResidentRent(req, res) {
   return res.json({ message: 'Rate updated', old_rate_paise: resident.rate_paise, new_rate_paise: newRate, rate_type: newType });
 }
 
-module.exports = { checkIn, listResidents, getResident, checkOut, checkoutPreview, approveCheckout, applyRefundDecision, extendStay, updateResidentRent };
+module.exports = { checkIn, listResidents, getResident, checkOut, checkoutPreview, approveCheckout, applyRefundDecision, extendStay, updateResidentRent, giveNotice, cancelNotice, stayTerms };
