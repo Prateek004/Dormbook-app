@@ -45,6 +45,9 @@ function buildBill(db, pid, residentId) {
   const reversed = new Set(rows.filter((e) => e.reversal_of).map((e) => e.reversal_of));
   const live = rows.filter((e) => !e.reversal_of && !reversed.has(e.id));
 
+  // PG / Hostel: say what the rent covers, e.g. "with breakfast & dinner".
+  const foodLabel = require('../services/propertyType').FOOD_LABEL[r.food_plan];
+  const food = foodLabel ? `, with ${foodLabel}` : '';
   const lines = live.filter((e) => e.kind === 'CHARGE' || e.kind === 'OPENING_DUES').map((e) => {
     const tax = e.tax_paise || 0;
     let description;
@@ -52,7 +55,7 @@ function buildBill(db, pid, residentId) {
     else if (e.category === 'rent') {
       const days = e.period_start && e.period_end ? daysBetween(e.period_start, e.period_end) : 0;
       description = `Room rent ${fmtD(e.period_start)} – ${fmtD(addDays(e.period_end, -1))}` +
-        (days ? ` (${days} ${days === 1 ? 'night' : 'nights'})` : '');
+        (days ? ` (${days} ${days === 1 ? 'night' : 'nights'})` : '') + food;
     } else description = cleanReason(e.reason) || CAT[e.category] || 'Charge';
     return { date: e.ref_date, description, rate: (e.tax_rate_bp || 0) / 100, taxable: e.amount_paise - tax, gst: tax, amount: e.amount_paise };
   });
