@@ -72,7 +72,22 @@
             <input id="reg-mobile" type="tel" placeholder="9XXXXXXXXX" required />
           </div>
           <div class="field">
-            <label for="reg-pg-name">PG / Hostel Name *</label>
+            <label for="reg-type">What do you run? *</label>
+            <select id="reg-type">
+              <option value="pg">PG (paying guest), rooms, monthly rent</option>
+              <option value="hostel">Hostel</option>
+              <option value="dormitory">Dormitory, bunk beds, daily rate</option>
+            </select>
+          </div>
+          <div class="field" id="reg-hostel-wrap" hidden>
+            <label for="reg-hostel-style">Kind of hostel</label>
+            <select id="reg-hostel-style">
+              <option value="monthly">Students or working people, monthly</option>
+              <option value="nightly">Travellers, per night</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="reg-pg-name">PG / Hostel / Dormitory name *</label>
             <input id="reg-pg-name" type="text" placeholder="Sunrise PG" required />
           </div>
           <div class="field">
