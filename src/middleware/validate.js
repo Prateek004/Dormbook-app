@@ -77,6 +77,8 @@ const SCHEMAS = {
     password:      { req: true, min: 8, max: 200, msg: 'Password must be at least 8 characters' },
     pg_name:       { max: 120 },
     city:          { max: 60 },
+    property_type: { max: 20, re: /^(pg|hostel|dormitory)$/, msg: 'Choose PG, Hostel or Dormitory' },
+    hostel_style:  { max: 20, re: /^(monthly|nightly)$/, msg: 'Hostel kind must be monthly or nightly' },
   },
   'POST /auth/forgot-password': {
     mobile: { req: true, max: 20 },
