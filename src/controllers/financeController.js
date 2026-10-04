@@ -201,7 +201,7 @@ function getPropertySettings(req, res) {
   const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.user.property_id);
   if (!prop) return res.status(404).json({ error: 'Property not found' });
   const acc = prop.account_id ? db.prepare('SELECT business_name FROM accounts WHERE id = ?').get(prop.account_id) : null;
-  return res.json({ ...prop, business_name: acc ? acc.business_name : prop.name });
+  return res.json({ ...prop, ...typeProfile(prop), business_name: acc ? acc.business_name : prop.name });
 }
 
 /**
@@ -275,12 +275,38 @@ function updatePropertySettings(req, res) {
     ['booking_lock_hours', 1, 720, 'Booking hold must be 1 to 720 hours'],
     ['refund_approval_threshold_paise', 0, 100000000, 'Refund approval limit is not valid'],
     ['cash_reconciliation_tolerance_paise', 0, 10000000, 'Cash difference allowed is not valid'],
+    ['notice_days', 0, 90, 'Notice period must be 0 to 90 days'],
+    ['lock_in_months', 0, 24, 'Lock-in must be 0 to 24 months'],
   ];
   for (const [k, min, max, msg] of ints) {
     if (!has(k)) continue;
     const n = Number(b[k]);
     if (!Number.isInteger(n) || n < min || n > max) return res.status(400).json({ error: msg });
     set[k] = n;
+  }
+
+  // Kind of property and what goes with it (see services/propertyType.js).
+  const PT = require('../services/propertyType');
+  const oneOf = (k, list, msg, allowEmpty) => {
+    if (!has(k)) return true;
+    const v = String(b[k]);
+    if (allowEmpty && v === '') { set[k] = null; return true; }
+    if (!list.includes(v)) { res.status(400).json({ error: msg }); return false; }
+    set[k] = v;
+    return true;
+  };
+  if (!oneOf('property_type', PT.TYPES, 'Type must be PG, Hostel or Dormitory')) return;
+  if (!oneOf('hostel_style', PT.HOSTEL_STYLES, 'Hostel kind must be monthly or nightly', true)) return;
+  if (!oneOf('gender', PT.GENDERS, 'Choose Boys, Girls or Co-living', true)) return;
+  if (!oneOf('food_plan', PT.FOOD_PLANS, 'Food plan is not valid')) return;
+  if (has('sharing_rates')) {
+    if (typeof b.sharing_rates !== 'object' || Array.isArray(b.sharing_rates)) return res.status(400).json({ error: 'Sharing rates are not valid' });
+    for (const [k, v] of Object.entries(b.sharing_rates)) {
+      const n = Number(k), p = Number(v);
+      if (!Number.isInteger(n) || n < 1 || n > PT.MAX_SHARING) return res.status(400).json({ error: `Sharing must be 1 to ${PT.MAX_SHARING} beds` });
+      if (!Number.isInteger(p) || p < 0 || p > 100000000) return res.status(400).json({ error: `Rent for ${n} sharing is not valid` });
+    }
+    set.sharing_rates = JSON.stringify(PT.parseSharingRates(b.sharing_rates));
   }
 
   const keys = Object.keys(set).filter((k) => cols.has(k));
@@ -305,7 +331,7 @@ function updatePropertySettings(req, res) {
 
   const out = db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId);
   const acc = out.account_id ? db.prepare('SELECT business_name FROM accounts WHERE id = ?').get(out.account_id) : null;
-  return res.json({ ...out, business_name: acc ? acc.business_name : out.name });
+  return res.json({ ...out, ...typeProfile(out), business_name: acc ? acc.business_name : out.name });
 }
 
 /** GET /api/v1/properties/profile — letterhead for reports (any signed-in user). */
@@ -324,7 +350,19 @@ function getPropertyProfile(req, res) {
     feature_beds: p.feature_beds !== 0,
     feature_gst: p.feature_gst !== 0,
     feature_user_access: p.feature_user_access !== 0,
+    ...typeProfile(p),
   });
+}
+
+/** Kind of property for the app screens (wording, setup, check-in defaults). */
+function typeProfile(p) {
+  const PT = require('../services/propertyType');
+  return {
+    property_type: PT.typeOf(p), hostel_style: p.hostel_style || null, long_stay: PT.isLongStay(p),
+    unit_word: PT.unitWord(p), gender: p.gender || null, food_plan: p.food_plan || 'none',
+    notice_days: p.notice_days || 0, lock_in_months: p.lock_in_months || 0,
+    sharing_rates: PT.parseSharingRates(p.sharing_rates),
+  };
 }
 
 function reportRange(q) {
