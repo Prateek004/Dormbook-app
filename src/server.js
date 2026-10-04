@@ -78,6 +78,12 @@ applyRateLimits(app);
 const share = require('./controllers/shareController');
 app.get('/b/:token', billLink, share.viewBill);
 
+// App icons with the DormBook logo (see src/brandIcons.js).
+const brandIcons = require('./brandIcons');
+for (const name of Object.keys(brandIcons)) {
+  app.get(`/icons/${name}`, (req, res) => res.set('Cache-Control', 'public, max-age=86400').type('png').send(brandIcons[name]));
+}
+
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/api/v1', routes);
 // Unknown API paths answer JSON 404 (not the app's HTML page).
@@ -163,11 +169,30 @@ function checkRequiredEnv() {
     setDb(db);
     autoSeedIfEmpty(db);
     startScheduler();
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`[SERVER] DormBook v4.0 on port ${PORT} (${ENV})`);
       // Cloudflare R2: one quick connection test so Railway logs say clearly if it works.
       require('./services/r2').check().catch(() => {});
     });
+    // Port taken or similar: exit so Railway restarts us, instead of idling without serving.
+    server.on('error', (err) => { console.error('[BOOT ERROR]', err.message); process.exit(1); });
+
+    // Railway sends SIGTERM on every deploy/restart. Stop taking new requests, let the open
+    // ones (a payment being saved, a PDF being sent) finish, close the database cleanly, exit.
+    let closing = false;
+    const shutdown = (signal) => {
+      if (closing) return;
+      closing = true;
+      console.log(`[SERVER] ${signal} received, finishing open requests...`);
+      const done = () => {
+        try { db.close(); } catch (e) { console.error('[SERVER] DB close failed:', e.message); }
+        process.exit(0);
+      };
+      server.close(done);
+      setTimeout(done, 10000).unref(); // never wait longer than 10 s
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT',  () => shutdown('SIGINT'));
   } catch (err) {
     console.error('[BOOT ERROR]', err.message, err.stack);
     process.exit(1);
