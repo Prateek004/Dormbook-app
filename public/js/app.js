@@ -44,6 +44,53 @@ if ('serviceWorker' in navigator) {
 window.addEventListener('online',  () => document.getElementById('offline-indicator')?.classList.add('hidden'));
 window.addEventListener('offline', () => document.getElementById('offline-indicator')?.classList.remove('hidden'));
 
+// ── Safety net ───────────────────────────────────────────────
+// Any error no screen handled shows a short message instead of leaving a frozen page.
+let _lastErrToast = 0;
+function onUnexpectedError(err) {
+  const msg = String((err && err.message) || err || '');
+  if (/ResizeObserver loop/.test(msg)) return; // harmless browser notice
+  console.error('[APP]', err);
+  if (Date.now() - _lastErrToast < 4000) return; // one message, not a flood
+  _lastErrToast = Date.now();
+  // Errors from api() already carry a message written for the user.
+  toast(err && err.status !== undefined ? msg : 'Something went wrong. Please try again.', 'error', 5000);
+}
+window.addEventListener('error', (e) => onUnexpectedError(e.error || e.message));
+window.addEventListener('unhandledrejection', (e) => onUnexpectedError(e.reason));
+
+// ── New version after a deploy ───────────────────────────────
+// The app notes the version it started with. After a deploy it refreshes itself when the user
+// comes back to it and nothing is half-filled; otherwise it shows a Refresh button. Phone app
+// users get updates this way too (the app loads from the server), with no new APK download.
+let _appBuild = null, _lastTyped = 0;
+document.addEventListener('input', () => { _lastTyped = Date.now(); }, true);
+async function checkForUpdate(userReturned) {
+  if (!navigator.onLine) return;
+  try {
+    const res = await fetch('/api/v1/health', { cache: 'no-store' });
+    const build = res.ok ? (await res.json()).build : null;
+    if (!build || build === 'dev') return;
+    if (!_appBuild) { _appBuild = build; return; }
+    if (build === _appBuild) return;
+    const modalOpen = !document.getElementById('modal-overlay')?.classList.contains('hidden');
+    const typing = Date.now() - _lastTyped < 5 * 60 * 1000;
+    if (userReturned && !modalOpen && !typing) { location.reload(); return; }
+    showUpdateBar();
+  } catch (_) { /* offline or server restarting: try again later */ }
+}
+function showUpdateBar() {
+  if (document.getElementById('update-bar')) return;
+  const bar = document.createElement('div');
+  bar.id = 'update-bar'; bar.className = 'update-bar'; bar.setAttribute('role', 'status');
+  bar.innerHTML = '<span>A new version of DormBook is ready.</span><button class="btn btn-primary btn-sm" type="button">Refresh</button>';
+  bar.querySelector('button').addEventListener('click', () => location.reload());
+  document.body.appendChild(bar);
+}
+window.addEventListener('load', () => checkForUpdate(false));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForUpdate(true); });
+setInterval(() => { if (document.visibilityState === 'visible') checkForUpdate(false); }, 10 * 60 * 1000);
+
 // ── State ────────────────────────────────────────────────────
 const STATE = { token: null, user: null, currentPage: null };
 
@@ -53,9 +100,27 @@ function newIdemKey() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
-async function api(method, path, body) {
+// A write sent again while the same one is still running (double tap, slow network)
+// shares the first request, so it is saved once. Every form gets this, not just the
+// ones that disable their button.
+const _inflight = new Map();
+function api(method, path, body) {
+  if (method === 'GET') return apiCall(method, path, body);
+  const key = `${method} ${path} ${JSON.stringify(body ?? null)}`;
+  if (_inflight.has(key)) return _inflight.get(key);
+  const p = apiCall(method, path, body).finally(() => _inflight.delete(key));
+  _inflight.set(key, p);
+  return p;
+}
+
+const API_TIMEOUT_MS = 60000; // long enough for an ID photo on slow mobile data
+
+async function apiCall(method, path, body) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), API_TIMEOUT_MS);
   const opts = {
     method,
+    signal: ctrl.signal,
     headers: {
       'Content-Type': 'application/json',
       ...(STATE.token ? { Authorization: `Bearer ${STATE.token}` } : {}),
@@ -64,7 +129,19 @@ async function api(method, path, body) {
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   };
-  const res = await fetch(`/api/v1${path}`, opts);
+  let res;
+  try {
+    res = await fetch(`/api/v1${path}`, opts);
+  } catch (_) {
+    // No answer at all (no internet, server restarting, timed out). A write may or may not
+    // have reached the server, so never say "not saved" for sure.
+    const msg = method === 'GET'
+      ? 'Cannot reach the server. Check your internet and try again.'
+      : 'No reply from the server. Check whether it was saved before trying again.';
+    throw Object.assign(new Error(msg), { status: 0, network: true });
+  } finally {
+    clearTimeout(timer);
+  }
   const data = await res.json().catch(() => ({}));
   if (res.status === 401 && STATE.token && !path.startsWith('/auth/login')) {
     // Session no longer valid (expired, server secret changed, or database reset).
@@ -134,6 +211,26 @@ async function getProfile(force) {
   return STATE.profile;
 }
 const gstLabel = (bp, incl) => bp ? `${bp / 100}% GST ${incl ? 'incl.' : 'extra'}` : 'No GST';
+
+// ── Kind of property ─────────────────────────────────────────
+// PG and Hostel use rooms (101, beds 101-A); Dormitory uses bunkers (0A, beds 0A1).
+// Long stay (PG, monthly hostel): monthly rent by sharing, no fixed leaving date, notice period.
+// Comes from the profile, so call after getProfile(); an unknown type means Dormitory (as before).
+function PTY() {
+  const p = STATE.profile || {};
+  const type = ['pg', 'hostel', 'dormitory'].includes(p.property_type) ? p.property_type : 'dormitory';
+  const rooms = type !== 'dormitory';
+  return {
+    type, rooms, longStay: !!p.long_stay,
+    unit: rooms ? 'Room' : 'Bunker', unitL: rooms ? 'room' : 'bunker', units: rooms ? 'rooms' : 'bunkers',
+    place: { pg: 'PG', hostel: 'Hostel', dormitory: 'Dormitory' }[type],
+    food: p.food_plan && p.food_plan !== 'none' ? p.food_plan : null,
+    noticeDays: p.notice_days || 0, gender: p.gender || null, sharing: p.sharing_rates || {},
+  };
+}
+const FOOD_LABEL = { breakfast: 'Breakfast', two_meals: 'Breakfast & dinner', three_meals: 'All meals' };
+const GENDER_LABEL = { boys: 'Boys', girls: 'Girls', coliving: 'Co-living' };
+const SHARING_LABEL = (n) => ({ 1: 'Single', 2: 'Double', 3: 'Triple' }[n] || `${n}`) + ' sharing';
 
 // ── Cash change helper: guest gives ₹500 for ₹300 → "Give back ₹200" ──
 // Only helps the cashier count; nothing extra is saved (the payment amount is what's recorded).
@@ -218,7 +315,7 @@ const NAV = [
   { section: 'Settings', items: [
     // One menu item, every setup screen as a tab inside.
     { id: 'settings_menu', label: '⚙️ Settings', title: 'Settings', tabs: [
-      { id: 'beds',     label: '🛏 Beds',            desc: 'Floors, bunkers and beds' },
+      { id: 'beds',     label: '🛏 Beds',            desc: 'Floors, rooms and beds' },
       { id: 'catalog',  label: '☕ Items & Prices',  desc: 'Tea, coffee, laundry for bills', perms: ['settings'] },
       { id: 'settings', label: '🏢 Business & GST',  desc: 'Name, address, GST, rules', perms: ['settings'] },
       { id: 'staff',    label: '👤 Users & Access',  desc: 'Staff logins and permissions', perms: ['staff'] },
@@ -462,6 +559,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Register form
   document.getElementById('register-btn')?.addEventListener('click', handleRegister);
+  document.getElementById('reg-type')?.addEventListener('change', (e) => {
+    document.getElementById('reg-hostel-wrap').hidden = e.target.value !== 'hostel';
+    document.getElementById('reg-pg-name').placeholder = { pg: 'Sunrise PG', hostel: 'Sunrise Hostel', dormitory: 'Sunrise Dormitory' }[e.target.value];
+  });
   document.getElementById('register-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleRegister(e); });
 
   // Forgot password — step 1 (send OTP)
@@ -519,6 +620,8 @@ async function handleRegister(e) {
       password:      document.getElementById('reg-password').value,
       pg_name:       document.getElementById('reg-pg-name').value.trim(),
       city:          document.getElementById('reg-city').value.trim() || undefined,
+      property_type: document.getElementById('reg-type').value,
+      hostel_style:  document.getElementById('reg-type').value === 'hostel' ? document.getElementById('reg-hostel-style').value : undefined,
     });
     STATE.token = data.token;
     STATE.user  = data.user;
@@ -587,6 +690,8 @@ async function handleForgotReset(e) {
 
 function showApp() {
   showScreen('main-app');
+  STATE.profile = null;            // a different account may have signed in on this phone
+  getProfile().catch(() => {});    // PG / Hostel / Dormitory wording for the screens
   document.getElementById('user-badge').textContent = `${STATE.user.name} · ${STATE.user.role}`;
   // Remove old listeners before adding (guard against double-attach after login → logout → login)
   const logoutBtn = document.getElementById('logout-btn');
@@ -751,15 +856,17 @@ async function markBedReady(bedId) {
 
 // ── Beds — Floor Map ──────────────────────────────────────────
 async function renderBeds(el) {
-  const floors = await api('GET', '/floors');
+  const [floors] = await Promise.all([api('GET', '/floors'), getProfile().catch(() => ({}))]);
+  const T = PTY();
   const ha = document.getElementById('header-actions');
   if (can('beds_setup')) {
     ha.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showAddFloorModal()">+ Add floor</button>`;
   }
   if (!floors.length) {
+    const sample = T.rooms ? '101-A, 101-B, 102-A…' : '0A1, 0A2, 0B1…';
     el.innerHTML = `<div class="empty-state"><div class="empty-icon">🛏</div>
       <p>No beds yet.</p>
-      ${can('beds_setup') ? `<p class="mt-12">Add your first floor: choose how many bunkers it has and how many beds each bunker has.<br/>Beds are numbered automatically: <b>0A1, 0A2, 0B1…</b> You can change the names later.</p>
+      ${can('beds_setup') ? `<p class="mt-12">Add your first floor: choose how many ${T.units} it has and how many beds each ${T.unitL} has.<br/>Beds are numbered automatically: <b>${sample}</b> You can change the names later.</p>
       <button class="btn btn-primary mt-12" onclick="showAddFloorModal()">+ Add floor</button>` : ''}</div>`;
     return;
   }
@@ -767,6 +874,7 @@ async function renderBeds(el) {
   floors.forEach(f => f.rooms.forEach(rm => { total += rm.total_beds; occ += rm.occupied; avail += rm.beds.filter(b => b.status === 'available').length; }));
   window._floorData = floors;
   const idx = Math.min(window._floorIdx || 0, floors.length - 1);
+  const wing = (f) => { const g = f.gender || T.gender; return g ? ` · ${GENDER_LABEL[g]}` : ''; };
   el.innerHTML = `
     <div class="kpis mb-20">
       <div class="kpi"><span>Total beds</span><strong>${total}</strong></div>
@@ -774,7 +882,7 @@ async function renderBeds(el) {
       <div class="kpi good"><span>Vacant</span><strong>${avail}</strong></div>
     </div>
     <div class="floor-tabs mb-12 btn-group">
-      ${floors.map((f, i) => `<button class="btn btn-sm ${i === idx ? 'btn-primary' : 'btn-outline'}" onclick="switchFloor(${i})">${h(f.label)} <span class="td-small">(${f.rooms.reduce((a, r) => a + r.total_beds, 0)})</span></button>`).join('')}
+      ${floors.map((f, i) => `<button class="btn btn-sm ${i === idx ? 'btn-primary' : 'btn-outline'}" onclick="switchFloor(${i})">${h(f.label)}${h(wing(f))} <span class="td-small">(${f.rooms.reduce((a, r) => a + r.total_beds, 0)})</span></button>`).join('')}
     </div>
     <div class="legend mb-12"><span class="dot available"></span>Vacant <span class="dot occupied"></span>Occupied <span class="dot cleaning"></span>Cleaning <span class="dot reserved"></span>On hold</div>
     <div id="floor-content"></div>`;
@@ -786,41 +894,54 @@ function switchFloor(idx) {
   document.querySelectorAll('.floor-tabs button').forEach((b, i) => { b.className = `btn btn-sm ${i === idx ? 'btn-primary' : 'btn-outline'}`; });
   const floor = window._floorData[idx];
   if (!floor) return;
+  const T = PTY();
   const edit = !!window._bedEdit && can('beds_setup');
   const isFree = (b) => !b.resident_name && b.status !== 'occupied' && b.status !== 'reserved';
   const fc = document.getElementById('floor-content');
+  const roomTitle = (rm) => T.rooms ? `Room ${h(rm.room_number)} <span class="td-small">· ${SHARING_LABEL(rm.beds.length)}</span>` : `Bunker ${h(rm.room_number)}`;
+  const bedRate = (b) => T.longStay && b.monthly_rate_paise ? `${rupees(b.monthly_rate_paise)}/mo` : '';
   fc.innerHTML = `
     ${can('beds_setup') ? `<div class="btn-group mb-12">
       ${edit ? `
         <button class="btn btn-primary btn-sm" onclick="setBedEdit(false)">✓ Done</button>
-        <button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunker</button>
+        <button class="btn btn-outline btn-sm" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add ${T.unitL}</button>
         ${floor.rooms.length ? `<button class="btn btn-outline btn-sm" onclick="showRenameModal(${idx})">✏️ Change names</button>` : ''}
+        <label class="btn btn-outline btn-sm" for="fl-wing">Wing
+          <select id="fl-wing" class="inline-select" onchange="saveFloorWing('${floor.id}', this.value)">
+            <option value="">${T.gender ? `Same as ${T.place} (${GENDER_LABEL[T.gender]})` : 'Not set'}</option>
+            ${Object.entries(GENDER_LABEL).map(([v, l]) => `<option value="${v}" ${floor.gender === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select></label>
         <button class="btn btn-outline btn-sm text-danger" onclick="removeFloorAsk('${floor.id}','${esc(floor.label)}')">🗑 Remove ${h(floor.label)}</button>`
       : `<button class="btn btn-outline btn-sm" onclick="setBedEdit(true)">✏️ Change beds (add / remove / rename)</button>`}
     </div>
-    ${edit ? `<p class="td-small mb-12">Tap <b>+ Bed</b> to add a bed, <b>✕</b> to remove a bed, or <b>Remove bunker</b>. Beds with a guest or a booking can't be removed.</p>` : ''}` : ''}
+    ${edit ? `<p class="td-small mb-12">Tap <b>+ Bed</b> to add a bed, <b>✕</b> to remove a bed, or <b>Remove ${T.unitL}</b>. Beds with a guest or a booking can't be removed.</p>` : ''}` : ''}
     ${floor.rooms.length ? `<div class="bunker-grid">${floor.rooms.map(rm => `
       <div class="bunker ${edit ? 'editing' : ''}">
-        <div class="bunker-name">Bunker ${h(rm.room_number)}</div>
+        <div class="bunker-name">${roomTitle(rm)}</div>
         <div class="bunker-beds">${rm.beds.map(b => `
           <div class="bed-wrap">
             <button class="bed-chip ${b.status}" onclick="showBedDetail('${b.id}')" title="${h(b.status)}">
               <span class="bed-no">${h(b.bed_label)}</span>
-              <span class="bed-who">${b.resident_name ? h(b.resident_name) : (b.status === 'available' ? 'Vacant' : h(b.status))}</span>
+              <span class="bed-who">${b.resident_name ? h(b.resident_name) : (b.status === 'available' ? (bedRate(b) || 'Vacant') : h(b.status))}</span>
             </button>
             ${edit && isFree(b) ? `<button class="bed-x" title="Remove bed ${h(b.bed_label)}" aria-label="Remove bed ${h(b.bed_label)}" onclick="removeBedAsk('${b.id}','${esc(b.bed_label)}')">✕</button>` : ''}
           </div>`).join('')}
         </div>
         ${edit ? `<div class="bunker-tools">
           <button class="btn btn-outline btn-sm" onclick="addBedToBunker('${rm.id}')">+ Bed</button>
-          <button class="btn btn-outline btn-sm text-danger" onclick="removeBunkerAsk('${rm.id}','${esc(rm.room_number)}')">Remove bunker</button>
+          <button class="btn btn-outline btn-sm text-danger" onclick="removeBunkerAsk('${rm.id}','${esc(rm.room_number)}')">Remove ${T.unitL}</button>
         </div>` : ''}
       </div>`).join('')}</div>`
-    : `<div class="empty-state"><p>No bunkers on this floor yet.</p>
-        ${can('beds_setup') ? `<button class="btn btn-primary mt-12" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add bunkers</button>` : ''}</div>`}`;
+    : `<div class="empty-state"><p>No ${T.units} on this floor yet.</p>
+        ${can('beds_setup') ? `<button class="btn btn-primary mt-12" onclick="showAddBunkersModal('${floor.id}','${esc(floor.label)}')">+ Add ${T.units}</button>` : ''}</div>`}`;
 }
 
 function setBedEdit(on) { window._bedEdit = on; switchFloor(window._floorIdx || 0); }
+
+async function saveFloorWing(floorId, gender) {
+  try { await api('PATCH', `/floors/${floorId}`, { gender }); toast(gender ? `Wing set to ${GENDER_LABEL[gender]}` : 'Wing cleared', 'success'); renderPage('beds'); }
+  catch (ex) { toast(ex.message, 'error'); }
+}
 
 async function addBedToBunker(roomId) {
   try { const b = await api('POST', `/rooms/${roomId}/beds`, {}); toast(`Bed ${b.bed_label} added`, 'success'); renderPage('beds'); }
@@ -832,27 +953,29 @@ async function removeBedAsk(bedId, label) {
   catch (ex) { toast(ex.message, 'error'); }
 }
 async function removeBunkerAsk(roomId, name) {
-  if (!confirm(`Remove bunker ${name} and all its beds?`)) return;
-  try { const r = await api('DELETE', `/rooms/${roomId}`); toast(`Bunker ${name} removed (${r.beds} beds)`, 'success'); renderPage('beds'); }
+  const T = PTY();
+  if (!confirm(`Remove ${T.unitL} ${name} and all its beds?`)) return;
+  try { const r = await api('DELETE', `/rooms/${roomId}`); toast(`${T.unit} ${name} removed (${r.beds} beds)`, 'success'); renderPage('beds'); }
   catch (ex) { toast(ex.message, 'error'); }
 }
 async function removeFloorAsk(floorId, label) {
-  if (!confirm(`Remove ${label} with all its bunkers and beds?`)) return;
+  if (!confirm(`Remove ${label} with all its ${PTY().units} and beds?`)) return;
   try { const r = await api('DELETE', `/floors/${floorId}`); toast(`${label} removed (${r.beds} beds)`, 'success'); window._floorIdx = 0; renderPage('beds'); }
   catch (ex) { toast(ex.message, 'error'); }
 }
 
-// Change names of the floor, its bunkers and beds (e.g. 0A1 → 101-A).
+// Change names of the floor, its rooms / bunkers and beds (e.g. 0A1 → 101-A).
 function showRenameModal(idx) {
   const floor = window._floorData[idx];
   if (!floor) return;
+  const T = PTY();
   openModal(`Change names: ${floor.label}`, `
     <p class="td-small">Type your own names, e.g. <b>101-A</b>, <b>101-B</b>. Every bed needs its own name.
       Bills and history stay linked — only the name changes.</p>
     <div class="field mt-12"><label for="rn-floor">Floor name</label><input id="rn-floor" maxlength="40" value="${h(floor.label)}" /></div>
     <div class="rename-list">${floor.rooms.map(rm => `
       <div class="rename-bunker">
-        <div class="field"><label for="rn-r-${rm.id}">Bunker</label><input id="rn-r-${rm.id}" data-room="${rm.id}" maxlength="20" value="${h(rm.room_number)}" /></div>
+        <div class="field"><label for="rn-r-${rm.id}">${T.unit}</label><input id="rn-r-${rm.id}" data-room="${rm.id}" maxlength="20" value="${h(rm.room_number)}" /></div>
         <div class="rename-beds">${rm.beds.map(b => `
           <div class="field"><label for="rn-b-${b.id}">Bed</label><input id="rn-b-${b.id}" data-bed="${b.id}" maxlength="20" value="${h(b.bed_label)}" /></div>`).join('')}
         </div>
@@ -872,7 +995,7 @@ async function submitRename(floorId) {
   const beds  = [...document.querySelectorAll('[data-bed]')].map(i => ({ id: i.dataset.bed, label: i.value.trim() }));
   try {
     const empty = [...rooms.map(r => r.name), ...beds.map(b => b.label)].some(v => !v);
-    if (empty) throw new Error('A name is empty. Every bunker and bed needs a name.');
+    if (empty) throw new Error(`A name is empty. Every ${PTY().unitL} and bed needs a name.`);
     const seen = new Set();
     for (const b of beds) { const k = b.label.toUpperCase(); if (seen.has(k)) throw new Error(`Bed name "${b.label}" is used twice`); seen.add(k); }
     const r = await api('PATCH', '/beds/names', { floors: [{ id: floorId, label: document.getElementById('rn-floor').value.trim() }], rooms, beds });
@@ -887,18 +1010,55 @@ async function saveBedName(bedId) {
   catch (ex) { toast(ex.message, 'error'); }
 }
 
+// Shared fields of "Add floor" and "Add rooms / bunkers": how many, beds each, rent.
+// Long stay (PG, monthly hostel): rent per bed per month, filled from the sharing rates in Settings.
+function layoutFieldsHtml(pfx, count) {
+  const T = PTY();
+  const per = 2, maxPer = T.rooms ? 12 : 6;
+  return `
+    <div class="field-row">
+      <div class="field"><label for="${pfx}-count">Number of ${T.units} *</label><input id="${pfx}-count" type="number" min="1" max="100" value="${count}" /></div>
+      <div class="field"><label for="${pfx}-per">${T.rooms ? 'Beds per room (sharing) *' : 'Beds per bunker *'}</label><input id="${pfx}-per" type="number" min="1" max="${maxPer}" value="${per}" />
+        ${T.rooms ? `<div class="field-note" id="${pfx}-sharing">${SHARING_LABEL(per)}</div>` : ''}</div>
+    </div>
+    <div class="field"><label for="${pfx}-rate">${T.longStay ? 'Rent per bed per month (₹)' : 'Rate per bed per day (₹)'}</label>
+      <input id="${pfx}-rate" type="number" min="0" step="0.01" placeholder="${T.longStay ? 'e.g. 8000' : 'e.g. 400'}" />
+      ${T.longStay ? `<div class="field-note">Filled from your sharing rents in Settings. Change it here if this floor is different.</div>` : ''}</div>`;
+}
+function bindLayoutFields(pfx, onChange) {
+  const T = PTY();
+  let typed = false;
+  const rate = document.getElementById(`${pfx}-rate`);
+  rate.addEventListener('input', () => { typed = true; });
+  const upd = () => {
+    const per = parseInt(document.getElementById(`${pfx}-per`).value) || 0;
+    const note = document.getElementById(`${pfx}-sharing`);
+    if (note) note.textContent = per ? SHARING_LABEL(per) : '';
+    if (T.longStay && !typed) rate.value = T.sharing[per] ? (T.sharing[per] / 100).toFixed(0) : '';
+    onChange && onChange();
+  };
+  [`${pfx}-count`, `${pfx}-per`].forEach(id => document.getElementById(id).addEventListener('input', upd));
+  upd();
+}
+function layoutBody(pfx) {
+  const T = PTY();
+  const paise = Math.round((parseFloat(document.getElementById(`${pfx}-rate`).value) || 0) * 100);
+  return {
+    bunkers: parseInt(document.getElementById(`${pfx}-count`).value),
+    beds_per_bunker: parseInt(document.getElementById(`${pfx}-per`).value),
+    ...(T.longStay ? { monthly_rate_paise: paise } : { daily_rate_paise: paise }),
+  };
+}
+
 function showAddFloorModal() {
+  const T = PTY();
   const next = (window._floorData || []).reduce((m, f) => Math.max(m, f.floor_number + 1), 0);
   openModal('Add Floor', `
     <div class="field-row">
-      <div class="field"><label>Floor number *</label><input id="af-num" type="number" min="0" value="${next}" /><div class="field-note">0 = Ground floor. Used as the first digit of bed numbers.</div></div>
-      <div class="field"><label>Name *</label><input id="af-label" value="${next === 0 ? 'Ground Floor' : `Floor ${next}`}" /></div>
+      <div class="field"><label for="af-num">Floor number *</label><input id="af-num" type="number" min="0" value="${next}" /><div class="field-note">0 = Ground floor. Used as the first digit of ${T.rooms ? 'room' : 'bed'} numbers.</div></div>
+      <div class="field"><label for="af-label">Name *</label><input id="af-label" value="${next === 0 ? 'Ground Floor' : `Floor ${next}`}" /></div>
     </div>
-    <div class="field-row">
-      <div class="field"><label>Number of bunkers *</label><input id="af-bunkers" type="number" min="1" max="100" value="6" /></div>
-      <div class="field"><label>Beds per bunker *</label><input id="af-per" type="number" min="1" max="6" value="2" /></div>
-    </div>
-    <div class="field"><label>Rate per bed per day (₹)</label><input id="af-rate" type="number" min="0" step="0.01" placeholder="e.g. 400" /></div>
+    ${layoutFieldsHtml('af', T.rooms ? 4 : 6)}
     <div class="preview-box" id="af-preview"></div>
     <div id="af-error" class="error-msg hidden"></div>
     <div class="btn-group mt-12">
@@ -907,14 +1067,17 @@ function showAddFloorModal() {
     </div>`);
   const upd = () => {
     const n = document.getElementById('af-num').value || '0';
-    const k = Math.max(0, Math.min(100, parseInt(document.getElementById('af-bunkers').value) || 0));
-    const per = Math.max(0, Math.min(6, parseInt(document.getElementById('af-per').value) || 0));
-    const letters = Array.from({ length: Math.min(k, 3) }, (_, i) => String.fromCharCode(65 + i));
-    const sample = letters.map(L => Array.from({ length: per }, (_, j) => `${n}${L}${j + 1}`).join(', ')).join(' · ');
+    const k = Math.max(0, Math.min(100, parseInt(document.getElementById('af-count').value) || 0));
+    const per = Math.max(0, Math.min(T.rooms ? 12 : 6, parseInt(document.getElementById('af-per').value) || 0));
+    const show = Math.min(k, 3);
+    const sample = Array.from({ length: show }, (_, i) => {
+      if (T.rooms) { const room = `${n}${String(i + 1).padStart(2, '0')}`; return Array.from({ length: per }, (_, j) => `${room}-${String.fromCharCode(65 + j)}`).join(', '); }
+      const L = String.fromCharCode(65 + i); return Array.from({ length: per }, (_, j) => `${n}${L}${j + 1}`).join(', ');
+    }).join(' · ');
     document.getElementById('af-preview').innerHTML = k && per ? `<b>${k * per} beds</b> will be created: ${h(sample)}${k > 3 ? ' …' : ''}` : '';
   };
-  ['af-num', 'af-bunkers', 'af-per'].forEach(id => document.getElementById(id).addEventListener('input', upd));
-  upd();
+  document.getElementById('af-num').addEventListener('input', upd);
+  bindLayoutFields('af', upd);
 }
 
 async function submitAddFloor() {
@@ -925,56 +1088,49 @@ async function submitAddFloor() {
       floor_number: parseInt(document.getElementById('af-num').value),
       label: document.getElementById('af-label').value.trim(),
     });
-    const r = await api('POST', `/floors/${f.id}/bunkers`, {
-      bunkers: parseInt(document.getElementById('af-bunkers').value),
-      beds_per_bunker: parseInt(document.getElementById('af-per').value),
-      daily_rate_paise: Math.round((parseFloat(document.getElementById('af-rate').value) || 0) * 100),
-    });
+    const r = await api('POST', `/floors/${f.id}/bunkers`, layoutBody('af'));
     toast(`${f.label}: ${r.total_beds} beds created`, 'success'); closeModal(); window._floorIdx = 99; renderPage('beds');
   } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
 }
 
 function showAddBunkersModal(floorId, floorLabel) {
-  openModal(`Add bunkers to ${floorLabel}`, `
-    <div class="field-row">
-      <div class="field"><label>Number of bunkers *</label><input id="ab-count" type="number" min="1" max="100" value="1" /></div>
-      <div class="field"><label>Beds per bunker *</label><input id="ab-per" type="number" min="1" max="6" value="2" /></div>
-    </div>
-    <div class="field"><label>Rate per bed per day (₹)</label><input id="ab-rate" type="number" min="0" step="0.01" placeholder="e.g. 400" /></div>
-    <p class="field-note">New bunkers continue the letters on this floor (e.g. after 0F comes 0G).</p>
+  const T = PTY();
+  openModal(`Add ${T.units} to ${floorLabel}`, `
+    ${layoutFieldsHtml('ab', 1)}
+    <p class="field-note">${T.rooms ? 'New rooms continue the numbers on this floor (e.g. after 104 comes 105).' : 'New bunkers continue the letters on this floor (e.g. after 0F comes 0G).'}</p>
     <div id="ab-error" class="error-msg hidden"></div>
     <div class="btn-group mt-12">
-      <button class="btn btn-primary" onclick="submitAddBunkers('${floorId}')">Add bunkers</button>
+      <button class="btn btn-primary" id="ab-submit" onclick="submitAddBunkers('${floorId}')">Add ${T.units}</button>
       <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
     </div>`);
+  bindLayoutFields('ab');
 }
 
 async function submitAddBunkers(floorId) {
   const err = document.getElementById('ab-error'); err.classList.add('hidden');
+  const btn = document.getElementById('ab-submit'); btn.disabled = true;
   try {
-    const r = await api('POST', `/floors/${floorId}/bunkers`, {
-      bunkers: parseInt(document.getElementById('ab-count').value),
-      beds_per_bunker: parseInt(document.getElementById('ab-per').value),
-      daily_rate_paise: Math.round((parseFloat(document.getElementById('ab-rate').value) || 0) * 100),
-    });
-    toast(`${r.total_beds} beds added (${r.created.map(c => c.bunker).join(', ')})`, 'success'); closeModal(); renderPage('beds');
-  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+    const r = await api('POST', `/floors/${floorId}/bunkers`, layoutBody('ab'));
+    toast(`${r.total_beds} beds added (${r.created.map(c => c.name || c.bunker).join(', ')})`, 'success'); closeModal(); renderPage('beds');
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
 }
 
 async function showBedDetail(bedId) {
-  const b = await api('GET', `/beds/${bedId}`);
+  const [b] = await Promise.all([api('GET', `/beds/${bedId}`), getProfile().catch(() => ({}))]);
+  const T = PTY();
   const isOwnerMgr = ['owner','manager'].includes(STATE.user.role);
+  const wing = b.floor_gender || T.gender;
   openModal(`Bed: ${b.bed_label}`, `
     <div class="field-row">
       <div><div class="stat-label">Status</div><span class="badge badge-${b.status==='available'?'success':b.status==='occupied'?'info':'warning'}">${b.status}</span></div>
-      <div><div class="stat-label">Bunker</div><p>${h(b.room_number||'—')} · ${h(b.floor_label||'')}</p></div>
+      <div><div class="stat-label">${T.unit}</div><p>${h(b.room_number||'—')} · ${h(b.floor_label||'')}${T.rooms && b.room_beds ? ` · ${SHARING_LABEL(b.room_beds)}` : ''}${wing ? ` · ${GENDER_LABEL[wing]}` : ''}</p></div>
     </div>
-    ${b.base_rate_paise ? `<div><div class="stat-label">Base Rate</div><p>${rupees(b.base_rate_paise)}/month</p></div>` : ''}
+    ${b.monthly_rate_paise ? `<div><div class="stat-label">Monthly rent</div><p>${rupees(b.monthly_rate_paise)}/month</p></div>` : ''}
     ${b.daily_rate_paise ? `<div><div class="stat-label">Daily Rate</div><p>${rupees(b.daily_rate_paise)}/day</p></div>` : ''}
     ${b.resident_name ? `
       <hr class="divider"/>
       <div><strong>${h(b.resident_name)}</strong> · ${b.resident_mobile||''}</div>
-      <div class="text-muted">Check-in: ${fmtDate(b.check_in_date)} · Expected out: ${fmtDate(b.expected_checkout)}</div>
+      <div class="text-muted">Check-in: ${fmtDate(b.check_in_date)} · ${b.expected_checkout ? `Expected out: ${fmtDate(b.expected_checkout)}` : 'No fixed leaving date'}</div>
       <div>Rate: ${rupees(b.rate_paise)} / ${b.rate_type === 'daily' ? 'day' : b.rate_type === 'weekly' ? 'week' : 'month'}</div>
       <div class="btn-group mt-12">
         <button class="btn btn-outline btn-sm" onclick="closeModal();showResidentDetail('${b.resident_id}')">View Details</button>
@@ -1006,9 +1162,11 @@ async function showBedDetail(bedId) {
         <div class="field"><label for="br-name">Name</label><input id="br-name" maxlength="20" value="${h(b.bed_label)}" /></div>
         <div><button class="btn btn-outline btn-sm" style="margin-top:24px" onclick="saveBedName('${bedId}')">Save name</button></div>
       </div>
-      <div class="section-title">Set Daily Rate</div>
+      <div class="section-title">${T.longStay ? 'Set monthly rent' : 'Set Daily Rate'}</div>
       <div class="field-row">
-        <div class="field"><label>Daily Rate (₹/day)</label><input id="br-rate" type="number" min="0" step="0.01" value="${((b.daily_rate_paise||0)/100).toFixed(2)}" /></div>
+        ${T.longStay
+          ? `<div class="field"><label for="br-rate">Rent (₹/month)</label><input id="br-rate" data-monthly="1" type="number" min="0" step="1" value="${((b.monthly_rate_paise||0)/100).toFixed(0)}" /><div class="field-note">Daily rate becomes month ÷ 30.</div></div>`
+          : `<div class="field"><label for="br-rate">Daily Rate (₹/day)</label><input id="br-rate" type="number" min="0" step="0.01" value="${((b.daily_rate_paise||0)/100).toFixed(2)}" /></div>`}
         <div><button class="btn btn-outline btn-sm" style="margin-top:24px" onclick="saveBedRate('${bedId}')">Save Rate</button></div>
       </div>
     ` : ''}
@@ -1025,9 +1183,11 @@ function navigateCheckinForBed(bedId) {
 
 async function saveBedRate(bedId) {
   try {
-    const rate = Math.round((parseFloat(document.getElementById('br-rate').value) || 0) * 100);
-    await api('PATCH', `/beds/${bedId}/rate`, { daily_rate_paise: rate });
-    toast(`Rate set to ${rupees(rate)}/day`, 'success');
+    const input = document.getElementById('br-rate');
+    const rate = Math.round((parseFloat(input.value) || 0) * 100);
+    const monthly = input.dataset.monthly === '1';
+    await api('PATCH', `/beds/${bedId}/rate`, monthly ? { monthly_rate_paise: rate } : { daily_rate_paise: rate });
+    toast(`Rate set to ${rupees(rate)}/${monthly ? 'month' : 'day'}`, 'success');
     closeModal(); renderPage('beds');
   } catch(ex) { toast(ex.message, 'error'); }
 }
@@ -1091,10 +1251,14 @@ async function renderCheckin(el) {
     return;
   }
   window._bedRates = {};
-  beds.forEach(b => { window._bedRates[b.id] = b.daily_rate_paise || 0; });
+  beds.forEach(b => { window._bedRates[b.id] = { d: b.daily_rate_paise || 0, m: b.monthly_rate_paise || 0, g: b.floor_gender || null }; });
   const prof = await getProfile(true).catch(() => ({}));
+  const T = PTY();
   const rentGst = prof.gst_enabled ? { bp: prof.rent_gst_rate_bp || 0, incl: prof.rent_gst_inclusive !== false } : { bp: 0, incl: true };
-  const bedOpts = beds.map(b => `<option value="${b.id}">${h(b.bed_label)}${b.status === 'reserved' ? ' (on hold)' : ''}${b.daily_rate_paise ? ` — ${rupees(b.daily_rate_paise)}/day` : ''}</option>`).join('');
+  const bedPrice = (b) => T.longStay && b.monthly_rate_paise ? ` — ${rupees(b.monthly_rate_paise)}/month` : b.daily_rate_paise ? ` — ${rupees(b.daily_rate_paise)}/day` : '';
+  const bedWing = (b) => { const g = b.floor_gender || T.gender; return g ? ` · ${GENDER_LABEL[g]}` : ''; };
+  const bedOpts = beds.map(b => `<option value="${b.id}">${h(b.bed_label)}${h(bedWing(b))}${b.status === 'reserved' ? ' (on hold)' : ''}${bedPrice(b)}</option>`).join('');
+  const askGender = T.rooms || !!T.gender || beds.some(b => b.floor_gender);
   const today = todayIST();
 
   el.innerHTML = `
@@ -1106,6 +1270,8 @@ async function renderCheckin(el) {
         <div class="field"><label for="ci-name">Full name *</label><input id="ci-name" autocomplete="off" required /></div>
         <div class="field"><label for="ci-mobile">Mobile *</label><input id="ci-mobile" type="tel" inputmode="numeric" maxlength="12" required /></div>
       </div>
+      ${askGender ? `<div class="field"><label for="ci-gender">Gender</label>
+        <select id="ci-gender"><option value="">Choose</option><option value="male">Male</option><option value="female">Female</option><option value="other">Other</option></select></div>` : ''}
       <div class="field-row">
         <div class="field"><label for="ci-idtype">ID proof *</label>
           <select id="ci-idtype">${ID_TYPES.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select></div>
@@ -1127,16 +1293,18 @@ async function renderCheckin(el) {
       <div class="field-row">
         <div class="field"><label for="ci-bed">Bed *</label><select id="ci-bed">${bedOpts}</select></div>
         <div class="field"><label for="ci-rate-type">Charged</label>
-          <select id="ci-rate-type"><option value="daily">Per day</option><option value="weekly">Per week</option><option value="monthly">Per month</option></select></div>
+          <select id="ci-rate-type"><option value="daily">Per day</option><option value="weekly">Per week</option><option value="monthly" ${T.longStay ? 'selected' : ''}>Per month</option></select></div>
       </div>
       <div class="field-row">
         <div class="field"><label for="ci-checkin">Check-in *</label><input id="ci-checkin" type="date" value="${today}" /></div>
-        <div class="field"><label for="ci-checkout">Leaving on *</label><input id="ci-checkout" type="date" /></div>
+        <div class="field" id="ci-checkout-wrap"><label for="ci-checkout">Leaving on *</label><input id="ci-checkout" type="date" /></div>
       </div>
+      <label class="consent" id="ci-open-wrap"><input type="checkbox" id="ci-open" ${T.longStay ? 'checked' : ''} /> No fixed leaving date (stays until they give notice${T.noticeDays ? `, ${T.noticeDays} days` : ''})</label>
       <div class="field-row">
         <div class="field"><label for="ci-rent">Rate (₹) *</label><input id="ci-rent" type="number" min="0" step="0.01" inputmode="decimal" /></div>
-        <div class="field"><label for="ci-deposit">Deposit (₹)</label><input id="ci-deposit" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0" /></div>
+        <div class="field"><label for="ci-deposit">Deposit (₹)</label><input id="ci-deposit" type="number" min="0" step="0.01" inputmode="decimal" placeholder="${T.longStay ? 'Usually 1–2 months rent' : '0'}" /></div>
       </div>
+      ${T.food ? `<label class="consent"><input type="checkbox" id="ci-food" checked /> Food included in rent: ${FOOD_LABEL[T.food]}</label>` : ''}
 
       <div class="ci-step"><span class="ci-num">3</span><strong>Payment now</strong></div>
       <div class="field-row">
@@ -1174,21 +1342,29 @@ async function renderCheckin(el) {
 
   window._ciFiles = {};
   const $ = (id) => document.getElementById(id);
+  // Open-ended stays (no leaving date) are only for weekly / monthly rent.
+  const openStay = () => $('ci-rate-type').value !== 'daily' && $('ci-open').checked;
+  const showOpen = () => {
+    $('ci-open-wrap').hidden = $('ci-rate-type').value === 'daily';
+    $('ci-checkout-wrap').hidden = openStay();
+  };
   const setOut = () => {
     const t = $('ci-rate-type').value, start = $('ci-checkin').value || today;
     const days = t === 'daily' ? 1 : t === 'weekly' ? 7 : 30;
     $('ci-checkout').value = new Date(Date.parse(start) + days * 86400000).toISOString().slice(0, 10);
+    showOpen();
   };
   const fillRate = () => {
-    const daily = window._bedRates[$('ci-bed').value] || 0;
-    if (!daily) return;
+    const r = window._bedRates[$('ci-bed').value] || {};
     const t = $('ci-rate-type').value;
-    $('ci-rent').value = ((daily * (t === 'daily' ? 1 : t === 'weekly' ? 7 : 30)) / 100).toFixed(2);
+    if (t === 'monthly' && r.m) { $('ci-rent').value = (r.m / 100).toFixed(2); return; }
+    if (!r.d) return;
+    $('ci-rent').value = ((r.d * (t === 'daily' ? 1 : t === 'weekly' ? 7 : 30)) / 100).toFixed(2);
   };
   const summary = () => {
     const rate = parseFloat($('ci-rent').value) || 0, dep = parseFloat($('ci-deposit').value) || 0, adv = parseFloat($('ci-advance').value) || 0;
     const t = $('ci-rate-type').value;
-    const nights = Math.max(0, Math.round((Date.parse($('ci-checkout').value) - Date.parse($('ci-checkin').value)) / 86400000));
+    const nights = openStay() ? 0 : Math.max(0, Math.round((Date.parse($('ci-checkout').value) - Date.parse($('ci-checkin').value)) / 86400000));
     const stay = t === 'daily' ? rate * nights : null;
     const withGst = (rupeesAmt) => gstSplit(Math.round(rupeesAmt * 100), rentGst.bp, rentGst.incl).gross;
     const gstNote = rentGst.bp ? ` · rent ${rentGst.incl ? 'includes' : 'plus'} ${rentGst.bp / 100}% GST` +
@@ -1201,6 +1377,7 @@ async function renderCheckin(el) {
   $('ci-bed').addEventListener('change', () => { fillRate(); summary(); });
   $('ci-rate-type').addEventListener('change', () => { fillRate(); setOut(); summary(); });
   $('ci-checkin').addEventListener('change', () => { setOut(); summary(); });
+  $('ci-open').addEventListener('change', () => { showOpen(); summary(); });
   ['ci-checkout', 'ci-rent', 'ci-deposit', 'ci-advance'].forEach(id => $(id).addEventListener('input', summary));
   const ciChange = bindCashChange('ci', () => (parseFloat($('ci-deposit').value) || 0) + (parseFloat($('ci-advance').value) || 0), () => $('ci-mode').value);
   ['ci-deposit', 'ci-advance'].forEach(id => $(id).addEventListener('input', ciChange));
@@ -1234,7 +1411,7 @@ async function renderCheckin(el) {
     }
     window._ciFiles = draft.files || {};
     Object.keys(window._ciFiles).forEach(markPhoto);
-    idHint(); summary(); ciChange();
+    idHint(); showOpen(); summary(); ciChange();
     const form = $('checkin-form');
     form.insertAdjacentHTML('afterbegin', `<div class="draft-banner" id="ci-draft-note">↩ Your unfinished check-in is back.
       <button type="button" class="btn btn-ghost btn-sm" id="ci-draft-clear">Start fresh</button></div>`);
@@ -1249,7 +1426,8 @@ async function renderCheckin(el) {
 // (memory + sessionStorage). Cleared on successful check-in, "Start fresh", Cancel and sign-out.
 const CI_DRAFT_KEY = 'dormbook_ci_draft';
 const CI_DRAFT_FIELDS = ['ci-name', 'ci-mobile', 'ci-idtype', 'ci-idnum', 'ci-bed', 'ci-rate-type', 'ci-checkin', 'ci-checkout', 'ci-rent',
-  'ci-deposit', 'ci-advance', 'ci-mode', 'ci-address', 'ci-ec-name', 'ci-ec-mobile', 'ci-from', 'ci-purpose', 'ci-due-day', 'ci-notes', 'ci-consent'];
+  'ci-deposit', 'ci-advance', 'ci-mode', 'ci-address', 'ci-ec-name', 'ci-ec-mobile', 'ci-from', 'ci-purpose', 'ci-due-day', 'ci-notes', 'ci-consent',
+  'ci-open', 'ci-food', 'ci-gender'];
 function ciDraftOwner() { return (STATE.user && STATE.user.id) || ''; }
 function saveCheckinDraft() {
   const fields = {};
@@ -1318,7 +1496,13 @@ async function submitCheckin() {
   if (!$('ci-name').value.trim()) return fail('Enter the guest\'s name', 'ci-name');
   if ($('ci-mobile').value.replace(/\D/g, '').length < 10) return fail('Enter a 10-digit mobile number', 'ci-mobile');
   if (!$('ci-idnum').value.trim()) return fail('Enter the ID number', 'ci-idnum');
-  if (!$('ci-checkout').value) return fail('Choose the leaving date', 'ci-checkout');
+  const openEnded = $('ci-rate-type').value !== 'daily' && $('ci-open').checked;
+  if (!openEnded && !$('ci-checkout').value) return fail('Choose the leaving date', 'ci-checkout');
+  // A guest placed on a Boys / Girls floor that doesn't match: ask once, never block.
+  const g = $('ci-gender') ? $('ci-gender').value : '';
+  const wing = (window._bedRates[$('ci-bed').value] || {}).g || PTY().gender;
+  if (g && wing && ((wing === 'boys' && g === 'female') || (wing === 'girls' && g === 'male'))
+    && !confirm(`This bed is on a ${GENDER_LABEL[wing]} floor. Check in anyway?`)) return;
   if (!(parseFloat($('ci-rent').value) > 0)) return fail('Enter the rate', 'ci-rent');
   if (!$('ci-consent').checked) return fail('Tick the consent box to store the guest\'s ID', 'ci-consent');
 
@@ -1329,8 +1513,11 @@ async function submitCheckin() {
     const data = {
       full_name: $('ci-name').value.trim(), mobile: $('ci-mobile').value.trim(),
       id_type: $('ci-idtype').value, id_number: $('ci-idnum').value.trim(), id_consent: true,
-      bed_id: $('ci-bed').value, check_in_date: checkIn, expected_checkout: $('ci-checkout').value,
+      bed_id: $('ci-bed').value, check_in_date: checkIn,
+      ...(openEnded ? { open_ended: true } : { expected_checkout: $('ci-checkout').value }),
       rate_type: $('ci-rate-type').value,
+      ...($('ci-food') ? { food_plan: $('ci-food').checked ? PTY().food : 'none' } : {}),
+      ...(g ? { gender: g } : {}),
       rate_paise: Math.round((parseFloat($('ci-rent').value) || 0) * 100),
       deposit_paise: Math.round((parseFloat($('ci-deposit').value) || 0) * 100),
       amount_paid_paise: Math.round((parseFloat($('ci-advance').value) || 0) * 100),
@@ -1378,7 +1565,7 @@ async function renderResidents(el) {
               return `<tr>
                 <td><a href="#" class="td-name" onclick="event.preventDefault();showResidentDetail('${r.id}')">${h(r.full_name)}</a><div class="td-small">${h(r.mobile)}</div></td>
                 <td><b>${h(r.bed_label || '—')}</b></td>
-                <td>${fmtDate(r.check_in_date)} → <span class="${late ? 'text-danger' : ''}">${fmtDate(out)}</span>${late ? '<div class="td-small text-danger">overstaying</div>' : ''}${r.status !== 'active' ? '<div class="td-small">left</div>' : ''}</td>
+                <td>${fmtDate(r.check_in_date)} → <span class="${late ? 'text-danger' : ''}">${out ? fmtDate(out) : 'No fixed date'}</span>${late ? '<div class="td-small text-danger">overstaying</div>' : ''}${r.notice_given_on && r.status === 'active' ? '<div class="td-small">on notice</div>' : ''}${r.status !== 'active' ? '<div class="td-small">left</div>' : ''}</td>
                 <td class="num">${r.pending_rent_paise > 0 ? `<span class="text-danger fw-bold">${rupees(r.pending_rent_paise)}</span>` : r.advance_credit_paise > 0 ? `<span class="text-success">${rupees(r.advance_credit_paise)} adv</span>` : '<span class="text-success">Paid</span>'}</td>
                 <td class="actions">
                   ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" title="Add tea, coffee, laundry… to the bill" onclick="showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Item</button>` : ''}
@@ -1406,12 +1593,16 @@ async function showResidentDetail(id) {
       <div><dt>Mobile</dt><dd>${h(r.mobile)}</dd></div>
       <div><dt>Bed</dt><dd>${h(r.bed_label || '—')}</dd></div>
       <div><dt>Check-in</dt><dd>${fmtDate(r.check_in_date)}</dd></div>
-      <div><dt>${r.status === 'active' ? 'Leaving on' : 'Left on'}</dt><dd>${fmtDate(r.actual_checkout || r.expected_checkout)}</dd></div>
+      <div><dt>${r.status === 'active' ? 'Leaving on' : 'Left on'}</dt><dd>${r.actual_checkout || r.expected_checkout ? fmtDate(r.actual_checkout || r.expected_checkout) : 'No fixed date'}</dd></div>
       <div><dt>Rate</dt><dd>${rupees(r.rate_paise)} / ${r.rate_type === 'daily' ? 'day' : r.rate_type === 'weekly' ? 'week' : 'month'}</dd></div>
+      ${FOOD_LABEL[r.food_plan] ? `<div><dt>Food</dt><dd>${FOOD_LABEL[r.food_plan]}</dd></div>` : ''}
+      ${r.notice_days ? `<div><dt>Notice period</dt><dd>${r.notice_days} days${r.lock_in_months ? ` · lock-in ${r.lock_in_months} mo` : ''}</dd></div>` : ''}
       <div><dt>ID proof</dt><dd>${h(r.id_display || r.aadhaar_display || '—')}</dd></div>
       ${r.balance ? `<div><dt>${r.balance.dues_paise >= 0 ? 'Dues' : 'Advance paid'}</dt><dd class="${r.balance.dues_paise > 0 ? 'text-danger' : 'text-success'} fw-bold">${rupees(Math.abs(r.balance.dues_paise))}</dd></div>
       <div><dt>Deposit held</dt><dd>${rupees(r.balance.deposit_paise)}</dd></div>` : ''}
     </dl>
+    ${r.status === 'active' && r.notice_given_on ? `<div class="notice-box">Notice given on <b>${fmtDate(r.notice_given_on)}</b>, leaving on <b>${fmtDate(r.expected_checkout)}</b>.
+      ${can('checkout') ? `<button class="btn btn-ghost btn-sm" onclick="cancelNoticeAsk('${r.id}')">Take back notice</button>` : ''}</div>` : ''}
     <div class="section-title">ID documents</div>
     <div class="doc-row">
       ${docs.map(d => can('view_id_docs')
@@ -1425,9 +1616,49 @@ async function showResidentDetail(id) {
       ${r.status === 'active' && can('addons') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showAddItemModal('${r.id}','${esc(r.full_name)}')">☕ Add item</button>` : ''}
       ${can('payments') || can('reports_finance') || can('checkout') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showBill('${r.id}')">🧾 Bill</button>` : ''}
       ${can('payments') || can('reports_finance') ? `<button class="btn btn-outline btn-sm" onclick="closeModal();showStatement('${r.id}')">Statement</button>` : ''}
+      ${r.status === 'active' && can('checkout') && !r.notice_given_on && (r.notice_days || r.rate_type !== 'daily') ? `<button class="btn btn-outline btn-sm" onclick="showNoticeModal('${r.id}','${esc(r.full_name)}',${Number(r.notice_days) || 0})">📝 Give notice</button>` : ''}
       ${r.status === 'active' && can('checkout') ? `<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${r.id}','${esc(r.full_name)}')">Check out</button>` : ''}
     </div>
   `, { wide: true });
+}
+
+// Tenant says they are leaving: leaving date = notice date + notice period (can be changed).
+function showNoticeModal(id, name, days) {
+  const today = todayIST();
+  const add = (d, n) => new Date(Date.parse(d) + n * 86400000).toISOString().slice(0, 10);
+  openModal(`Notice: ${name}`, `
+    <div class="field-row">
+      <div class="field"><label for="nt-date">Notice given on</label><input id="nt-date" type="date" value="${today}" max="${today}" /></div>
+      <div class="field"><label for="nt-leave">Leaving on</label><input id="nt-leave" type="date" value="${add(today, days || 30)}" /></div>
+    </div>
+    <p class="td-small" id="nt-note"></p>
+    <div id="nt-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" id="nt-save" onclick="submitNotice('${id}', ${days})">Save notice</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>`);
+  const note = () => {
+    const d = document.getElementById('nt-date').value, l = document.getElementById('nt-leave').value;
+    const served = Math.round((Date.parse(l) - Date.parse(d)) / 86400000);
+    document.getElementById('nt-note').textContent = !days ? 'No notice period is set for this stay.'
+      : served >= days ? `Full ${days}-day notice.` : `${days - served} days short of the ${days}-day notice. You can charge for these days at check-out.`;
+  };
+  document.getElementById('nt-date').addEventListener('change', () => { document.getElementById('nt-leave').value = add(document.getElementById('nt-date').value, days || 30); note(); });
+  document.getElementById('nt-leave').addEventListener('change', note);
+  note();
+}
+async function submitNotice(id, days) {
+  const err = document.getElementById('nt-error'); err.classList.add('hidden');
+  const btn = document.getElementById('nt-save'); btn.disabled = true;
+  try {
+    const r = await api('POST', `/residents/${id}/notice`, { notice_date: document.getElementById('nt-date').value, leaving_date: document.getElementById('nt-leave').value });
+    toast(`Notice saved. Leaving on ${fmtDate(r.expected_checkout)}`, 'success'); closeModal(); refreshCurrentPage(); showResidentDetail(id);
+  } catch (ex) { err.textContent = ex.message; err.classList.remove('hidden'); btn.disabled = false; }
+}
+async function cancelNoticeAsk(id) {
+  if (!confirm('Take back the notice? The guest stays on.')) return;
+  try { await api('DELETE', `/residents/${id}/notice`); toast('Notice taken back', 'success'); refreshCurrentPage(); showResidentDetail(id); }
+  catch (ex) { toast(ex.message, 'error'); }
 }
 
 async function viewDocument(residentId, docId) {
@@ -1486,7 +1717,8 @@ async function showCheckoutModal(id, name) {
         + (p.to_collect_paise > 0
           ? line('<b>Collect from guest</b>', `<b>${rupees(p.to_collect_paise)}</b>`, 'bill-total bad')
           : line('<b>Give back to guest</b>', `<b>${rupees(p.refund_paise)}</b>`, 'bill-total good'))
-        + (p.needs_approval ? '<div class="td-small mt-12">The refund will wait for the owner\'s approval. The bed is freed after approval.</div>' : '');
+        + (p.needs_approval ? '<div class="td-small mt-12">The refund will wait for the owner\'s approval. The bed is freed after approval.</div>' : '')
+        + termsWarning(p.terms);
       window._coChange && window._coChange();
       const btn = document.getElementById('co-submit');
       btn.disabled = false;
@@ -1503,6 +1735,25 @@ async function showCheckoutModal(id, name) {
   document.getElementById('co-date').addEventListener('change', load);
   document.getElementById('co-extra').addEventListener('input', () => { clearTimeout(window._coT); window._coT = setTimeout(load, 300); });
   load();
+}
+
+// Notice period / lock-in on the leaving date. Only a warning: staff decide whether to charge.
+function termsWarning(t) {
+  if (!t) return '';
+  const parts = [];
+  if (t.notice_short_days > 0) {
+    parts.push(`${t.notice_given_on ? `Notice given on ${fmtDate(t.notice_given_on)}` : 'No notice was given'}: <b>${t.notice_short_days} of ${t.notice_days} days</b> short.
+      <button type="button" class="btn btn-outline btn-sm" onclick="addNoticeCharge(${t.notice_short_charge_paise}, ${t.notice_short_days})">Add ${rupees(t.notice_short_charge_paise)} for short notice</button>`);
+  }
+  if (t.before_lock_in) parts.push(`Leaving before the lock-in ends on <b>${fmtDate(t.lock_in_end)}</b>.`);
+  return parts.length ? `<div class="notice-box">${parts.join('<br/>')}</div>` : '';
+}
+function addNoticeCharge(paise, days) {
+  const extra = document.getElementById('co-extra');
+  extra.value = (((parseFloat(extra.value) || 0) * 100 + paise) / 100).toFixed(2);
+  const note = document.getElementById('co-extra-note');
+  note.value = [note.value.trim(), `Short notice: ${days} days`].filter(Boolean).join(', ');
+  extra.dispatchEvent(new Event('input'));
 }
 
 async function submitCheckout(id) {
@@ -2580,13 +2831,49 @@ async function renderSettings(el, onlyTab) {
   `;
 
   function businessTabHtml(st, rateOpts) {
+    const type = st.property_type || 'dormitory';
+    const sh = st.sharing_rates || {};
+    const opt = (v, l, cur) => `<option value="${v}" ${cur === v ? 'selected' : ''}>${l}</option>`;
     return `
+    <div class="card mb-20">
+      <strong>What you run</strong>
+      <p class="td-small mt-4">Changes the words on screen (room or bunker), how beds are set up and the check-in defaults. Guests, beds and money already saved stay exactly as they are.</p>
+      <div class="field-row mt-12">
+        <div class="field"><label for="ps-type">Type</label>
+          <select id="ps-type" onchange="settingsTypeUi()">${opt('pg', 'PG (paying guest)', type)}${opt('hostel', 'Hostel', type)}${opt('dormitory', 'Dormitory', type)}</select></div>
+        <div class="field" id="ps-hostel-wrap"><label for="ps-hostel">Kind of hostel</label>
+          <select id="ps-hostel" onchange="settingsTypeUi()">${opt('monthly', 'Students / working people, monthly', st.hostel_style || 'monthly')}${opt('nightly', 'Travellers, per night', st.hostel_style)}</select></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label for="ps-gender">For</label>
+          <select id="ps-gender">${opt('', 'Not set', st.gender || '')}${opt('boys', 'Boys', st.gender)}${opt('girls', 'Girls', st.gender)}${opt('coliving', 'Co-living', st.gender)}</select>
+          <div class="field-note">A floor can be set differently on the Beds page (e.g. a girls wing).</div></div>
+        <div class="field"><label for="ps-food">Food included in rent</label>
+          <select id="ps-food">${opt('none', 'No food', st.food_plan || 'none')}${opt('breakfast', 'Breakfast', st.food_plan)}${opt('two_meals', 'Breakfast & dinner', st.food_plan)}${opt('three_meals', 'All meals', st.food_plan)}</select>
+          <div class="field-note">Shown at check-in and on the bill.</div></div>
+      </div>
+      <div id="ps-long">
+        <div class="field-row">
+          <div class="field"><label for="ps-notice">Notice period (days)</label><input id="ps-notice" type="number" min="0" max="90" value="${st.notice_days || 0}" />
+            <div class="field-note">Most PGs ask for 30 days. 0 = no notice period.</div></div>
+          <div class="field"><label for="ps-lockin">Lock-in (months)</label><input id="ps-lockin" type="number" min="0" max="24" value="${st.lock_in_months || 0}" />
+            <div class="field-note">Staff are warned if someone leaves earlier. 0 = none.</div></div>
+        </div>
+        <div class="field"><label>Rent per bed per month, by sharing (₹)</label>
+          <div class="field-row three">${[1, 2, 3, 4, 5, 6].map(n => `<div class="field"><label for="ps-sh-${n}" class="td-small">${SHARING_LABEL(n)}</label>
+            <input id="ps-sh-${n}" data-sharing="${n}" type="number" min="0" step="1" inputmode="numeric" value="${sh[n] ? sh[n] / 100 : ''}" placeholder="—" /></div>`).join('')}</div>
+          <div class="field-note">New rooms get these rents. People already staying keep the rent agreed at check-in.</div>
+          <button type="button" class="btn btn-outline btn-sm mt-12" id="ps-apply" onclick="applySharingRents()">Save and use these rents for all beds</button>
+        </div>
+      </div>
+    </div>
+
     <div class="card mb-20">
       <strong>Your business</strong>
       <p class="td-small mt-4">Printed at the top of reports and bills.</p>
       <div class="field-row mt-12">
         <div class="field"><label for="ps-company">Company name *</label><input id="ps-company" maxlength="120" value="${h(st.business_name || '')}" placeholder="e.g. A&P Infotech Solutions Pvt Ltd" /></div>
-        <div class="field"><label for="ps-name">Dormitory name *</label><input id="ps-name" maxlength="120" value="${h(st.name || '')}" /></div>
+        <div class="field"><label for="ps-name">${{ pg: 'PG', hostel: 'Hostel' }[st.property_type] || 'Dormitory'} name *</label><input id="ps-name" maxlength="120" value="${h(st.name || '')}" /></div>
       </div>
       <div class="field"><label for="ps-address">Address</label><input id="ps-address" maxlength="250" value="${h(st.address || '')}" placeholder="Building, street, area" /></div>
       <div class="field-row three">
@@ -2650,6 +2937,37 @@ async function renderSettings(el, onlyTab) {
 
   // Render the active tab on load
   window._renderSettingsTab(activeTab);
+  settingsTypeUi();
+}
+
+// Settings: show the hostel kind for hostels, and notice / sharing rents for long stays.
+function settingsTypeUi() {
+  const t = document.getElementById('ps-type');
+  if (!t) return;
+  const hostel = t.value === 'hostel';
+  document.getElementById('ps-hostel-wrap').hidden = !hostel;
+  document.getElementById('ps-long').hidden = !(t.value === 'pg' || (hostel && document.getElementById('ps-hostel').value === 'monthly'));
+}
+function settingsTypeBody() {
+  const v = (id) => document.getElementById(id).value;
+  const sharing = {};
+  document.querySelectorAll('[data-sharing]').forEach(i => { const r = parseFloat(i.value); if (r > 0) sharing[i.dataset.sharing] = Math.round(r * 100); });
+  return {
+    property_type: v('ps-type'), hostel_style: v('ps-type') === 'hostel' ? v('ps-hostel') : '',
+    gender: v('ps-gender'), food_plan: v('ps-food'),
+    notice_days: Math.round(Number(v('ps-notice')) || 0), lock_in_months: Math.round(Number(v('ps-lockin')) || 0),
+    sharing_rates: sharing,
+  };
+}
+async function applySharingRents() {
+  const btn = document.getElementById('ps-apply'); btn.disabled = true;
+  try {
+    await api('PATCH', '/properties/settings', settingsTypeBody());
+    const r = await api('POST', '/beds/apply-sharing-rates', {});
+    await getProfile(true).catch(() => {});
+    toast(`Rent set for ${r.updated} bed(s)${r.skipped ? `. ${r.skipped} bed(s) in rooms with no rent for that sharing were left as they were` : ''}`, r.skipped ? 'warning' : 'success', 6000);
+  } catch (ex) { toast(ex.message, 'error'); }
+  btn.disabled = false;
 }
 
 async function submitSettings() {
@@ -2659,7 +2977,7 @@ async function submitSettings() {
   const btn = document.getElementById('ps-save'); btn.disabled = true;
   try {
     if (!v('ps-company')) throw new Error('Company name cannot be empty');
-    if (!v('ps-name')) throw new Error('Dormitory name cannot be empty');
+    if (!v('ps-name')) throw new Error('Name cannot be empty');
     const gstOn = document.getElementById('ps-gst-on').checked;
     if (gstOn && !v('ps-gstin')) throw new Error('Type your GSTIN to charge GST');
     for (const [id, label] of [['ps-clean', 'Cleaning time'], ['ps-lock', 'Booking hold'], ['ps-refund', 'Refund limit'], ['ps-cash', 'Cash difference']]) {
@@ -2676,6 +2994,7 @@ async function submitSettings() {
       booking_lock_hours: int('ps-lock'),
       refund_approval_threshold_paise: int('ps-refund') * 100,
       cash_reconciliation_tolerance_paise: int('ps-cash') * 100,
+      ...settingsTypeBody(),
     });
     await getProfile(true).catch(() => {});
     toast('Settings saved', 'success');
