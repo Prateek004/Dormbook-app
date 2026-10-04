@@ -244,6 +244,16 @@ tbody td { padding: 10px 12px; color: var(--gray-700); }
 .bunker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
 .bunker { background: #fff; border: 1px solid var(--gray-200); border-radius: var(--radius); padding: 10px; }
 .bunker-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gray-400); margin-bottom: 8px; }
+.bunker-name .td-small { text-transform: none; letter-spacing: 0; font-weight: 500; }
+/* A small select inside a button-styled label (floor wing on the beds page). */
+.inline-select { margin-left: 6px; border: 0; background: transparent; font: inherit; color: inherit; padding: 0; }
+/* "New version ready" bar shown after a deploy while the app is open. */
+.update-bar { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); z-index: 3000;
+  display: flex; align-items: center; gap: 12px; background: var(--gray-900, #111); color: #fff; padding: 10px 14px; border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.25); font-size: 14px; max-width: calc(100% - 32px); }
+.update-bar .btn { white-space: nowrap; }
+.app-ui .update-bar { bottom: calc(80px + env(safe-area-inset-bottom, 0px)); }
+.notice-box { border: 1px solid var(--warning); background: rgba(217, 119, 6, .08); border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 14px; }
 .bunker-beds { display: grid; gap: 6px; }
 .bed-chip { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; border: 1.5px solid var(--gray-200); border-radius: 6px; background: #fff; padding: 8px 10px; cursor: pointer; font: inherit; }
 .bed-chip:hover { box-shadow: var(--shadow-md); }
