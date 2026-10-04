@@ -20,14 +20,15 @@ const ledger = require('./ledger');
 
 let isStarted = false;
 
-// Wrap a job so a synchronous throw (e.g. a DB error) is logged and swallowed
-// instead of propagating out of the cron tick and crashing the process.
+// Wrap a job so a throw (e.g. a DB error) or a failed async job is logged with the
+// job's name and swallowed, instead of escaping the cron tick.
 function safe(name, fn) {
+  const fail = (err) => console.error(`[SCHEDULER] Job '${name}' failed:`, err && err.stack ? err.stack : err);
   return () => {
     try {
-      fn();
+      Promise.resolve(fn()).catch(fail);
     } catch (err) {
-      console.error(`[SCHEDULER] Job '${name}' failed:`, err && err.stack ? err.stack : err);
+      fail(err);
     }
   };
 }
