@@ -178,6 +178,29 @@ function runMigrations(db) {
     revoked_at TEXT, views INTEGER NOT NULL DEFAULT 0, last_viewed_at TEXT)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_bill_links_resident ON bill_links(resident_id)');
 
+  // PG / Hostel / Dormitory. All additive. Every existing property becomes 'dormitory',
+  // which is exactly how it worked before, so nothing changes for current users.
+  const typeCols = {
+    properties: [['property_type', "TEXT NOT NULL DEFAULT 'dormitory'"], ['hostel_style', 'TEXT'], ['gender', 'TEXT'],
+      ['food_plan', "TEXT NOT NULL DEFAULT 'none'"], ['notice_days', 'INTEGER NOT NULL DEFAULT 0'],
+      ['lock_in_months', 'INTEGER NOT NULL DEFAULT 0'], ['sharing_rates', 'TEXT']],
+    floors: [['gender', 'TEXT']],
+    beds: [['monthly_rate_paise', 'INTEGER NOT NULL DEFAULT 0']],
+    // Copied from the property at check-in, so a later settings change never alters an existing stay.
+    residents: [['food_plan', 'TEXT'], ['notice_days', 'INTEGER NOT NULL DEFAULT 0'], ['lock_in_months', 'INTEGER NOT NULL DEFAULT 0'],
+      ['notice_given_on', 'TEXT'], ['checkout_before_notice', 'TEXT'], ['gender', 'TEXT']],
+  };
+  for (const [table, list] of Object.entries(typeCols)) {
+    const have = getColumns(table);
+    if (!have.length) continue;
+    for (const [col, type] of list) {
+      if (!have.includes(col)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+        console.log(`[MIGRATION] Added ${table}.${col}`);
+      }
+    }
+  }
+
   // Ledger + reports (additive, idempotent). Loaded lazily so a problem in the
   // ledger can never stop the rest of the app from booting.
   try {
