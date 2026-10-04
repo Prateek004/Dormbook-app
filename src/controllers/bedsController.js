@@ -3,6 +3,7 @@
 const { v4: uuidv4 } = require('uuid');
 const { getDb }       = require('../db/connection');
 const { writeAudit }  = require('../middleware/auditLog');
+const PT = require('../services/propertyType');
 
 // Ensure new columns exist — runs once, idempotent
 let _migrated = false;
@@ -25,7 +26,7 @@ function listBeds(req, res) {
     SELECT b.*, r.full_name as resident_name, r.id as resident_id,
            r.monthly_rent_paise, r.rate_paise, r.rate_type,
            r.deposit_paise, r.expected_checkout, r.check_in_date,
-           rm.room_number, rm.room_type, f.label as floor_label, f.floor_number
+           rm.room_number, rm.room_type, f.label as floor_label, f.floor_number, f.gender as floor_gender
     FROM beds b
     LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
     LEFT JOIN rooms rm ON rm.id = b.room_id
@@ -44,7 +45,8 @@ function listBeds(req, res) {
 function getBed(req, res) {
   const db = getDb();
   const bed = db.prepare(`
-    SELECT b.*, rm.room_number, rm.room_type, f.label as floor_label, f.floor_number,
+    SELECT b.*, rm.room_number, rm.room_type, f.label as floor_label, f.floor_number, f.gender as floor_gender,
+           (SELECT COUNT(*) FROM beds x WHERE x.room_id = b.room_id AND x.removed_at IS NULL) as room_beds,
            r.id as resident_id, r.full_name as resident_name, r.mobile as resident_mobile,
            r.monthly_rent_paise, r.rate_paise, r.rate_type, r.deposit_paise,
            r.check_in_date, r.expected_checkout
@@ -99,11 +101,17 @@ function updateBedStatus(req, res) {
 function updateBedRate(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-  const { daily_rate_paise } = req.body;
-  if (daily_rate_paise === undefined || daily_rate_paise === null) {
+  const { daily_rate_paise, monthly_rate_paise } = req.body;
+  // PG / Hostel owners price by the month; the daily rate then follows (month ÷ 30).
+  const monthlyIn = monthly_rate_paise === undefined || monthly_rate_paise === null ? null : Number(monthly_rate_paise);
+  if (monthlyIn !== null && (!Number.isInteger(monthlyIn) || monthlyIn < 0)) {
+    return res.status(400).json({ error: 'monthly_rate_paise must be a whole number ≥ 0' });
+  }
+  if (monthlyIn === null && (daily_rate_paise === undefined || daily_rate_paise === null)) {
     return res.status(400).json({ error: 'daily_rate_paise is required' });
   }
-  const rateNum = parseFloat(daily_rate_paise);
+  const rateNum = monthlyIn !== null && (daily_rate_paise === undefined || daily_rate_paise === null)
+    ? Math.round(monthlyIn / 30) : parseFloat(daily_rate_paise);
   if (!isFinite(rateNum) || rateNum < 0) {
     return res.status(400).json({ error: 'daily_rate_paise must be a number ≥ 0' });
   }
@@ -112,11 +120,12 @@ function updateBedRate(req, res) {
     .get(req.params.id, propertyId);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
 
-  db.prepare(`UPDATE beds SET daily_rate_paise=?, base_rate_paise=?, updated_at=datetime('now') WHERE id=?`)
-    .run(rate, rate, req.params.id);
+  const monthly = monthlyIn !== null ? monthlyIn : (bed.monthly_rate_paise || 0);
+  db.prepare(`UPDATE beds SET daily_rate_paise=?, base_rate_paise=?, monthly_rate_paise=?, updated_at=datetime('now') WHERE id=?`)
+    .run(rate, rate, monthly, req.params.id);
   writeAudit({ propertyId, userId: req.user.id,
     action: 'BED_RATE_UPDATE', entityType: 'beds', entityId: req.params.id,
-    amountPaise: rate, snapshot: { old: bed.daily_rate_paise, new: rate }, ip: req.ip });
+    amountPaise: rate, snapshot: { old: bed.daily_rate_paise, new: rate, old_monthly: bed.monthly_rate_paise || 0, monthly }, ip: req.ip });
   return res.json(db.prepare('SELECT * FROM beds WHERE id = ?').get(req.params.id));
 }
 
@@ -178,7 +187,7 @@ function listFloors(req, res) {
   const floors = db.prepare('SELECT * FROM floors WHERE property_id = ? AND removed_at IS NULL ORDER BY floor_number').all(req.user.property_id);
   const rooms  = db.prepare('SELECT * FROM rooms WHERE property_id = ? AND removed_at IS NULL ORDER BY length(room_number), room_number').all(req.user.property_id);
   const beds   = db.prepare(`
-    SELECT b.id, b.room_id, b.bed_label, b.status, b.daily_rate_paise,
+    SELECT b.id, b.room_id, b.bed_label, b.status, b.daily_rate_paise, b.monthly_rate_paise,
            r.full_name as resident_name, r.id as resident_id
     FROM beds b LEFT JOIN residents r ON r.bed_id = b.id AND r.status = 'active'
     WHERE b.property_id = ? AND b.removed_at IS NULL
@@ -257,60 +266,115 @@ function bunkerLetter(i) {
   return s;
 }
 
+/** Bed names inside a PG / Hostel room: 101-A, 101-B, ... */
+function roomBedLabel(room, i) { return `${room}-${bunkerLetter(i)}`; }
+/** Room numbers on a floor: floor 1 → 101, 102 …; ground floor → 001, 002 … */
+function roomName(floorNumber, n) { return `${floorNumber}${String(n).padStart(2, '0')}`; }
+
 /**
  * POST /api/v1/floors/:id/bunkers
- * Dormitory setup in one step: N bunkers × M beds on a floor.
- * Bunkers are named <floor><letter> (0A, 0B, ...) and beds <floor><letter><n>
- * (0A1, 0A2, 0B1, ...). New bunkers continue after the floor's existing letters.
+ * One-step setup: N bunkers (Dormitory) or N rooms (PG / Hostel) × M beds on a floor.
+ *   Dormitory: bunkers 0A, 0B … with beds 0A1, 0A2 … (unchanged from before).
+ *   PG/Hostel: rooms 101, 102 … with beds 101-A, 101-B …; rent per month by sharing.
+ * New names continue after the floor's existing ones and never reuse a name in the property.
  */
 function addBunkers(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
   const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, propertyId);
   if (!floor) return res.status(404).json({ error: 'Floor not found' });
+  const prop = PT.propertyRow(db, propertyId);
+  const rooms = PT.usesRooms(prop);
+  const unit = PT.unitWord(prop).toLowerCase();
+  const maxPer = rooms ? PT.MAX_SHARING : 6;
 
   const count = Number(req.body.bunkers);
   const perBunker = req.body.beds_per_bunker === undefined ? 2 : Number(req.body.beds_per_bunker);
-  const rate = req.body.daily_rate_paise === undefined ? 0 : Number(req.body.daily_rate_paise);
-  if (!Number.isInteger(count) || count < 1 || count > 100) return res.status(400).json({ error: 'Number of bunkers must be 1–100' });
-  if (!Number.isInteger(perBunker) || perBunker < 1 || perBunker > 6) return res.status(400).json({ error: 'Beds per bunker must be 1–6' });
+  if (!Number.isInteger(count) || count < 1 || count > 100) return res.status(400).json({ error: `Number of ${unit}s must be 1–100` });
+  if (!Number.isInteger(perBunker) || perBunker < 1 || perBunker > maxPer) return res.status(400).json({ error: `Beds per ${unit} must be 1–${maxPer}` });
+  // Rent: a monthly rent (PG / Hostel), else a daily rate. With neither, use the sharing rate from Settings.
+  const monthlyIn = req.body.monthly_rate_paise === undefined ? null : Number(req.body.monthly_rate_paise);
+  if (monthlyIn !== null && (!Number.isInteger(monthlyIn) || monthlyIn < 0)) return res.status(400).json({ error: 'Monthly rent must be 0 or more' });
+  let rate = req.body.daily_rate_paise === undefined ? 0 : Number(req.body.daily_rate_paise);
   if (!Number.isInteger(rate) || rate < 0) return res.status(400).json({ error: 'Rate must be 0 or more' });
+  const monthly = monthlyIn !== null && monthlyIn > 0 ? monthlyIn
+    : (rooms && !rate ? (PT.parseSharingRates(prop.sharing_rates)[perBunker] || 0) : 0);
+  if (!rate && monthly) rate = Math.round(monthly / 30);
 
   const prefix = String(floor.floor_number);
-  const existing = db.prepare('SELECT room_number FROM rooms WHERE floor_id = ? AND removed_at IS NULL').all(floor.id).map((r) => r.room_number);
   const taken = new Set(db.prepare('SELECT room_number FROM rooms WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((r) => r.room_number.toUpperCase()));
   // Beds may have been renamed by the owner (e.g. 0A1 -> 0B2), so an auto name
   // is skipped if ANY of its bed names is already used anywhere in the property.
   const bedTaken = new Set(db.prepare('SELECT bed_label FROM beds WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((b) => b.bed_label.toUpperCase()));
   const created = [];
   const now = new Date().toISOString();
+  const roomType = rooms ? (perBunker === 1 ? 'private' : 'shared') : 'dormitory';
+  const bedName = (name, k) => (rooms ? roomBedLabel(name, k) : `${name}${k + 1}`);
 
   db.transaction(() => {
     let i = 0;
     while (created.length < count) {
-      const name = prefix + bunkerLetter(i++);
-      if (i > 2000) throw new Error('Could not find free bunker names');
-      if (taken.has(name.toUpperCase()) || existing.includes(name)) continue;
-      if (Array.from({ length: perBunker }, (_, k) => `${name}${k + 1}`.toUpperCase()).some((l) => bedTaken.has(l))) continue;
+      const name = rooms ? roomName(prefix, ++i) : prefix + bunkerLetter(i++);
+      if (i > 2000) throw new Error(`Could not find free ${unit} names`);
+      if (taken.has(name.toUpperCase())) continue;
+      if (Array.from({ length: perBunker }, (_, k) => bedName(name, k).toUpperCase()).some((l) => bedTaken.has(l))) continue;
       const roomId = uuidv4();
-      db.prepare("INSERT INTO rooms (id, floor_id, property_id, room_number, room_type, created_at) VALUES (?,?,?,?,'dormitory',?)")
-        .run(roomId, floor.id, propertyId, name, now);
+      db.prepare('INSERT INTO rooms (id, floor_id, property_id, room_number, room_type, created_at) VALUES (?,?,?,?,?,?)')
+        .run(roomId, floor.id, propertyId, name, roomType, now);
       const beds = [];
-      for (let n = 1; n <= perBunker; n++) {
-        const label = `${name}${n}`;
-        db.prepare(`INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, status, created_at, updated_at)
-          VALUES (?,?,?,?,?,?,'available',?,?)`).run(uuidv4(), roomId, propertyId, label, rate, rate, now, now);
+      for (let k = 0; k < perBunker; k++) {
+        const label = bedName(name, k);
+        db.prepare(`INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, monthly_rate_paise, status, created_at, updated_at)
+          VALUES (?,?,?,?,?,?,?,'available',?,?)`).run(uuidv4(), roomId, propertyId, label, rate, rate, monthly, now, now);
         beds.push(label);
       }
       taken.add(name.toUpperCase());
       beds.forEach((l) => bedTaken.add(l.toUpperCase()));
-      created.push({ bunker: name, beds });
+      created.push({ bunker: name, name, beds });
     }
   })();
 
-  writeAudit({ propertyId, userId: req.user.id, action: 'BUNKERS_CREATED', entityType: 'floors', entityId: floor.id,
-    snapshot: { bunkers: created.map((c) => c.bunker), beds_per_bunker: perBunker, rate }, ip: req.ip });
-  return res.status(201).json({ floor: floor.label, created, total_beds: created.length * perBunker });
+  writeAudit({ propertyId, userId: req.user.id, action: rooms ? 'ROOMS_CREATED' : 'BUNKERS_CREATED', entityType: 'floors', entityId: floor.id,
+    snapshot: { [rooms ? 'rooms' : 'bunkers']: created.map((c) => c.name), beds_per_bunker: perBunker, rate, monthly }, ip: req.ip });
+  return res.status(201).json({ floor: floor.label, created, total_beds: created.length * perBunker, unit: PT.unitWord(prop) });
+}
+
+/**
+ * POST /api/v1/beds/apply-sharing-rates — PG / Hostel: set every bed's monthly rent from the
+ * sharing rates in Settings (a room with 2 beds gets the double-sharing rent, and so on).
+ * Only the rate offered to NEW tenants changes; people already staying keep their agreed rent.
+ */
+function applySharingRates(req, res) {
+  const db = getDb();
+  const pid = req.user.property_id;
+  const rates = PT.parseSharingRates(PT.propertyRow(db, pid).sharing_rates);
+  if (!Object.keys(rates).length) return res.status(400).json({ error: 'Set the rent for each sharing type in Settings first' });
+  const rooms = db.prepare(`SELECT rm.id, COUNT(b.id) n FROM rooms rm JOIN beds b ON b.room_id = rm.id AND b.removed_at IS NULL
+    WHERE rm.property_id = ? AND rm.removed_at IS NULL GROUP BY rm.id`).all(pid);
+  let updated = 0, skipped = 0;
+  db.transaction(() => {
+    for (const rm of rooms) {
+      const m = rates[rm.n];
+      if (!m) { skipped += rm.n; continue; }
+      updated += db.prepare(`UPDATE beds SET monthly_rate_paise = ?, daily_rate_paise = ?, base_rate_paise = ?, updated_at = datetime('now')
+        WHERE room_id = ? AND removed_at IS NULL`).run(m, Math.round(m / 30), Math.round(m / 30), rm.id).changes;
+    }
+  })();
+  auditSafe(req, 'SHARING_RATES_APPLIED', 'beds', pid, { rates, updated, skipped });
+  return res.json({ updated, skipped });
+}
+
+/** PATCH /api/v1/floors/:id — Boys / Girls / Co-living wing for one floor ("" = same as the property). */
+function updateFloor(req, res) {
+  const db = getDb();
+  const pid = req.user.property_id;
+  const floor = db.prepare('SELECT * FROM floors WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
+  if (!floor) return res.status(404).json({ error: 'Floor not found' });
+  const g = req.body && req.body.gender != null ? String(req.body.gender) : '';
+  if (g && !PT.GENDERS.includes(g)) return res.status(400).json({ error: 'Choose Boys, Girls or Co-living' });
+  db.prepare('UPDATE floors SET gender = ? WHERE id = ?').run(g || null, floor.id);
+  auditSafe(req, 'FLOOR_UPDATED', 'floors', floor.id, { gender: g || null });
+  return res.json(db.prepare('SELECT * FROM floors WHERE id = ?').get(floor.id));
 }
 
 /**
@@ -333,6 +397,7 @@ function renameNames(req, res) {
   if (floorsIn.length + roomsIn.length + bedsIn.length > 2000) return res.status(400).json({ error: 'Too many changes at once' });
 
   const bad = (msg) => res.status(400).json({ error: msg });
+  const unit = PT.unitWord(PT.propertyRow(db, propertyId));
 
   // Load current names so we can check the final result for duplicates.
   const floors = new Map(db.prepare('SELECT id, label FROM floors WHERE property_id = ? AND removed_at IS NULL').all(propertyId).map((f) => [f.id, f]));
@@ -349,9 +414,9 @@ function renameNames(req, res) {
   }
   for (const r of roomsIn) {
     const cur = rooms.get(String(r && r.id));
-    if (!cur) return bad('Bunker not found');
+    if (!cur) return bad(`${unit} not found`);
     const name = cleanName(r.name);
-    if (!NAME_RE.test(name)) return bad(`Bunker name "${name}" is not valid. Use 1–20 letters, numbers, space or - _ . / #`);
+    if (!NAME_RE.test(name)) return bad(`${unit} name "${name}" is not valid. Use 1–20 letters, numbers, space or - _ . / #`);
     if (name !== cur.room_number) { roomChanges.push({ id: cur.id, name }); cur.room_number = name; }
   }
   for (const b of bedsIn) {
@@ -370,7 +435,7 @@ function renameNames(req, res) {
   const dupBed = dup([...beds.values()].map((b) => b.bed_label));
   if (dupBed) return res.status(409).json({ error: `Bed name "${dupBed}" is used twice. Every bed needs its own name.` });
   const dupRoom = dup([...rooms.values()].map((r) => r.room_number));
-  if (dupRoom) return res.status(409).json({ error: `Bunker name "${dupRoom}" is used twice. Every bunker needs its own name.` });
+  if (dupRoom) return res.status(409).json({ error: `${unit} name "${dupRoom}" is used twice. Every ${unit.toLowerCase()} needs its own name.` });
 
   if (!floorChanges.length && !roomChanges.length && !bedChanges.length) return res.json({ changed: 0 });
 
@@ -452,24 +517,29 @@ function removeBed(req, res) {
 function addBedToRoom(req, res) {
   const db = getDb();
   const pid = req.user.property_id;
+  const prop = PT.propertyRow(db, pid);
+  const unit = PT.unitWord(prop);
   const room = db.prepare('SELECT * FROM rooms WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
-  if (!room) return res.status(404).json({ error: 'Bunker not found' });
+  if (!room) return res.status(404).json({ error: `${unit} not found` });
   const live = db.prepare('SELECT * FROM beds WHERE room_id = ? AND removed_at IS NULL ORDER BY rowid').all(room.id);
-  if (live.length >= 12) return res.status(400).json({ error: 'A bunker can have at most 12 beds' });
+  if (live.length >= 12) return res.status(400).json({ error: `A ${unit.toLowerCase()} can have at most 12 beds` });
   const used = new Set(db.prepare('SELECT upper(bed_label) l FROM beds WHERE property_id = ? AND removed_at IS NULL').all(pid).map((r) => r.l));
   let label = cleanName(req.body && req.body.label);
   if (label) {
     if (!NAME_RE.test(label)) return res.status(400).json({ error: `Bed name "${label}" is not valid. Use 1–20 letters, numbers, space or - _ . / #` });
     if (used.has(label.toUpperCase())) return res.status(409).json({ error: `Bed name "${label}" is already used` });
   } else {
-    for (let n = 1; n < 200; n++) { const l = `${room.room_number}${n}`; if (!used.has(l.toUpperCase())) { label = l; break; } }
+    // PG / Hostel rooms: 101-A, 101-B …  Dormitory bunkers: 0A1, 0A2 …
+    const auto = (n) => (PT.usesRooms(prop) ? roomBedLabel(room.room_number, n - 1) : `${room.room_number}${n}`);
+    for (let n = 1; n < 200; n++) { const l = auto(n); if (!used.has(l.toUpperCase())) { label = l; break; } }
     if (!label || label.length > 20) return res.status(400).json({ error: 'Type a name for the new bed' });
   }
   const rate = req.body && req.body.daily_rate_paise !== undefined ? Number(req.body.daily_rate_paise) : (live[0] ? live[0].daily_rate_paise : 0);
   if (!Number.isInteger(rate) || rate < 0) return res.status(400).json({ error: 'Rate must be 0 or more' });
+  const monthly = live[0] ? (live[0].monthly_rate_paise || 0) : 0;
   const id = uuidv4(); const now = new Date().toISOString();
-  db.prepare(`INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, status, created_at, updated_at)
-    VALUES (?,?,?,?,?,?,'available',?,?)`).run(id, room.id, pid, label, rate, rate, now, now);
+  db.prepare(`INSERT INTO beds (id, room_id, property_id, bed_label, daily_rate_paise, base_rate_paise, monthly_rate_paise, status, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,'available',?,?)`).run(id, room.id, pid, label, rate, rate, monthly, now, now);
   auditSafe(req, 'BED_ADDED', 'beds', id, { bed: label, bunker: room.room_number });
   return res.status(201).json(db.prepare('SELECT * FROM beds WHERE id = ?').get(id));
 }
@@ -479,7 +549,7 @@ function removeRoom(req, res) {
   const db = getDb();
   const pid = req.user.property_id;
   const room = db.prepare('SELECT * FROM rooms WHERE id = ? AND property_id = ? AND removed_at IS NULL').get(req.params.id, pid);
-  if (!room) return res.status(404).json({ error: 'Bunker not found' });
+  if (!room) return res.status(404).json({ error: `${PT.unitWord(PT.propertyRow(db, pid))} not found` });
   const beds = db.prepare('SELECT * FROM beds WHERE room_id = ? AND removed_at IS NULL').all(room.id);
   const busy = assertAllFree(db, beds);
   if (busy) return res.status(409).json({ error: busy });
@@ -511,4 +581,4 @@ function removeFloor(req, res) {
   return res.json({ removed: floor.label, bunkers: rooms.length, beds: beds.length });
 }
 
-module.exports = { removeBed, addBedToRoom, removeRoom, removeFloor, renameNames, listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter };
+module.exports = { removeBed, addBedToRoom, removeRoom, removeFloor, renameNames, listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors, addFloor, addRoom, addBunkers, bunkerLetter, applySharingRates, updateFloor };
