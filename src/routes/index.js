@@ -66,6 +66,7 @@ router.get  ('/floors',          authenticate, sameProperty, beds.listFloors);
 router.post ('/floors',          authenticate, sameProperty, can('beds_setup'), beds.addFloor);
 router.post ('/floors/:id/bunkers', authenticate, sameProperty, can('beds_setup'), beds.addBunkers);
 router.delete('/floors/:id',     authenticate, sameProperty, can('beds_setup'), beds.removeFloor);
+router.patch('/floors/:id',      authenticate, sameProperty, can('beds_setup'), beds.updateFloor);
 router.post ('/rooms/:id/beds',  authenticate, sameProperty, can('beds_setup'), beds.addBedToRoom);
 router.delete('/rooms/:id',      authenticate, sameProperty, can('beds_setup'), beds.removeRoom);
 router.delete('/beds/:id',       authenticate, sameProperty, can('beds_setup'), beds.removeBed);
@@ -79,6 +80,7 @@ router.patch('/beds/:id/status', authenticate, sameProperty, requireRole('recept
 router.patch('/beds/:id/rate',   authenticate, sameProperty, can('beds_setup'), beds.updateBedRate);
 router.patch('/beds/names',     authenticate, sameProperty, can('beds_setup'), beds.renameNames);
 router.patch('/beds/bulk-rate',  authenticate, sameProperty, can('beds_setup'), beds.bulkUpdateBedRate);
+router.post ('/beds/apply-sharing-rates', authenticate, sameProperty, can('beds_setup'), beds.applySharingRates);
 
 // ── Residents ─────────────────────────────────────────────
 router.post('/residents',                        authenticate, sameProperty, can('checkin'), checkin.checkIn);
@@ -89,6 +91,9 @@ router.post('/residents/:id/checkout',           authenticate, sameProperty, can
 router.post('/residents/:id/checkout/approve',   authenticate, sameProperty, can('approvals'), assertOwnsResource('residents'), checkin.approveCheckout);
 router.post('/residents/:id/extend',             authenticate, sameProperty, can('residents_edit'), assertOwnsResource('residents'), checkin.extendStay);
 router.patch('/residents/:id/rent',              authenticate, sameProperty, can('residents_edit'), assertOwnsResource('residents'), checkin.updateResidentRent);
+// PG / Hostel: tenant gives notice (sets the leaving date) or takes it back.
+router.post  ('/residents/:id/notice',           authenticate, sameProperty, can('checkout'), assertOwnsResource('residents'), checkin.giveNotice);
+router.delete('/residents/:id/notice',           authenticate, sameProperty, can('checkout'), assertOwnsResource('residents'), checkin.cancelNotice);
 
 // ── Resident ID documents ─────────────────────────────────
 router.post  ('/residents/:id/documents',        authenticate, sameProperty, can('checkin', 'view_id_docs'), assertOwnsResource('residents'), docs.uploadDocument);
@@ -235,6 +240,22 @@ function verifyWebhookSecret(req, res, next) {
   next();
 }
 
-router.get('/health', (req, res) => res.json({ status: 'ok', version: '4.0.0', timestamp: new Date().toISOString() }));
+// build: fingerprint of the app files. The app compares it to tell users a new version is ready.
+const BUILD = (() => {
+  try {
+    const crypto = require('crypto'), fs = require('fs'), path = require('path');
+    const hash = crypto.createHash('sha1');
+    for (const f of ['index.html', 'js/app.js', 'css/app.css']) hash.update(fs.readFileSync(path.join(__dirname, '..', '..', 'public', f)));
+    return hash.digest('hex').slice(0, 12);
+  } catch (_) { return 'dev'; }
+})();
+router.get('/health', (req, res) => res.json({ status: 'ok', version: '4.0.0', build: BUILD, timestamp: new Date().toISOString() }));
+
+// Every route handler goes through aw(), so an async handler added later (and forgotten
+// above) answers with an error instead of leaving the user's screen spinning forever.
+for (const layer of router.stack) {
+  if (!layer.route) continue;
+  for (const l of layer.route.stack) if (l.handle.length < 4) l.handle = aw(l.handle);
+}
 
 module.exports = router;
