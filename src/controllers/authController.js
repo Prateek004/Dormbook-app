@@ -168,6 +168,11 @@ function register(req, res) {
   const email = str(b.email).toLowerCase().trim().slice(0, 120);
   const pg_name = str(b.pg_name).trim().slice(0, 120);
   const city = str(b.city).trim().slice(0, 60);
+  // Kind of property. Older app versions send nothing: they get Dormitory, as before.
+  const property_type = ['pg', 'hostel', 'dormitory'].includes(b.property_type) ? b.property_type : 'dormitory';
+  const hostel_style = property_type === 'hostel' ? (b.hostel_style === 'nightly' ? 'nightly' : 'monthly') : null;
+  // Most Indian PGs and monthly hostels ask for 30 days' notice; the owner can change it in Settings.
+  const longStay = property_type === 'pg' || hostel_style === 'monthly';
 
   if (!business_name || !owner_name || !b.mobile || !password) {
     return res.status(400).json({ error: 'business_name, owner_name, mobile, and password are required' });
@@ -210,6 +215,7 @@ function register(req, res) {
       insertAdaptive(db, 'properties', {
         id: propertyId, account_id: accountId, name: pg_name || business_name,
         city, owner_id: userId, created_at: now,
+        property_type, hostel_style, notice_days: longStay ? 30 : 0,
       });
 
       db.prepare(`
